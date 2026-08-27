@@ -1,0 +1,26 @@
+# Apple Silicon acceleration mode. The Python worker runs natively on macOS so
+# PyTorch can access Metal/MPS; Docker runs the rest of the application.
+services:
+  backend:
+    environment:
+      WORKER_URL: http://host.docker.internal:8090
+    ports:
+      - "127.0.0.1:${BACKEND_HOST_PORT:-8080}:8080"
+    # The native worker is started separately, so backend only waits for Mongo.
+    depends_on: !override
+      mongo:
+        condition: service_healthy
+    # Native macOS and Docker must see the exact same generated media folder.
+    # This does not alter the normal named appdata volume.
+    volumes: !override
+      - ${DJ_DATA_PATH:-./.dj-attatouille-data}:/data
+      - ${MUSIC_LIBRARY_PATH:-./music}:/music:ro
+
+  # Hide the Linux container worker in this mode; it cannot access Apple Metal.
+  worker:
+    profiles: [container-worker]
+
+  # The native worker uses this local endpoint for its Qdrant vector calls.
+  qdrant:
+    ports:
+      - "127.0.0.1:${QDRANT_HOST_PORT:-6333}:6333"

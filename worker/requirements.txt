@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+librosa==0.10.2.post1
+mutagen==1.47.0
+numpy==1.26.4
+pydub==0.25.1
+# 1.13.1 supports the native arm64 Python 3.9 bundled with macOS, enabling
+# PyTorch MPS. The worker only uses stable signal-processing APIs shared with
+# 1.14, so this also remains compatible with the Docker Python 3.11 image.
+scipy==1.13.1

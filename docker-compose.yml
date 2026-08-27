@@ -1,0 +1,107 @@
+name: dj-attatouille
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${DJ_PORT:-4173}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      MONGO_URL: ${MONGO_URL:-mongodb://mongo:27017}
+      WORKER_URL: http://worker:8090
+      DATA_ROOT: /data
+      MUSIC_ROOT: /music
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - appdata:/data
+      - ${MUSIC_LIBRARY_PATH:-./music}:/music:ro
+    depends_on:
+      mongo:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+      args:
+        INSTALL_HARMONIX: ${INSTALL_HARMONIX:-true}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    environment:
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      BACKEND_URL: ${BACKEND_URL:-http://backend:8080}
+      DATA_ROOT: /data
+      MUSIC_ROOT: /music
+      # Harmonix/all-in-one is the default local structure model. Set this to
+      # librosa only when deliberately opting out of the deeper analysis.
+      ANALYSIS_MODEL: ${ANALYSIS_MODEL:-harmonix}
+      # auto uses CUDA whenever the container receives an NVIDIA GPU; otherwise
+      # it stays on CPU. docker-compose.gpu.yml makes CUDA available on Linux.
+      ANALYSIS_DEVICE: ${ANALYSIS_DEVICE:-auto}
+      # Fast preserves rhythmic/energy/spectral trends without full HTDemucs
+      # source separation. Set to full only for a deliberate slow, full-stem pass.
+      HARMONIX_PROFILE: ${HARMONIX_PROFILE:-fast}
+      ANALYSIS_SAMPLE_RATE: ${ANALYSIS_SAMPLE_RATE:-22050}
+      HARMONIX_PROXY_SAMPLE_RATE: ${HARMONIX_PROXY_SAMPLE_RATE:-22050}
+      # The virtual DJ gain knob and final master bus. Gain trims are bounded
+      # per track before transitions; the final limiter protects overlap peaks.
+      DJ_TARGET_LUFS: ${DJ_TARGET_LUFS:--14}
+      DJ_MAX_TRIM_DB: ${DJ_MAX_TRIM_DB:-8}
+      MASTER_TARGET_DBFS: ${MASTER_TARGET_DBFS:--14}
+      MASTER_CEILING_DBFS: ${MASTER_CEILING_DBFS:--1}
+    volumes:
+      - appdata:/data
+      - ${MUSIC_LIBRARY_PATH:-./music}:/music:ro
+      - model-cache:/root/.cache
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:8.0
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.4
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  appdata:
+  mongo-data:
+  qdrant-data:
+  model-cache:

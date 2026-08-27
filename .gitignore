@@ -1,0 +1,16 @@
+.env
+appdata/
+music/
+frontend/dist/
+frontend/node_modules/
+backend/target/
+worker/__pycache__/
+worker/app/__pycache__/
+
+.dj-attatouille-data/
+
+.venv-mps/
+
+worker/demix/htdemucs/
+worker/spec/
+worker/tests/__pycache__/

@@ -1,0 +1,15 @@
+services:
+  worker:
+    build:
+      args:
+        # CUDA 12.4 build of the same PyTorch version used by Harmonix.
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu124
+    environment:
+      ANALYSIS_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
