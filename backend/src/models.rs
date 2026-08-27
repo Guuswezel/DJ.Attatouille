@@ -25,6 +25,8 @@ pub struct Track {
     pub downbeats: Vec<f64>,
     pub genres: Vec<String>,
     pub segments: Vec<Segment>,
+    #[serde(default)]
+    pub phrase_states: Vec<PhraseState>,
     pub cues: TrackCues,
     pub embedding_indexed: bool,
 }
@@ -38,6 +40,25 @@ pub struct Segment {
     pub energy: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhraseState {
+    pub start: f64,
+    pub end: f64,
+    pub phrase_index: usize,
+    pub energy: f64,
+    pub energy_slope: f64,
+    pub bass_activity: f64,
+    pub drum_activity: f64,
+    pub vocal_activity: f64,
+    pub spectral_density: f64,
+    pub harmonic_density: f64,
+    pub novelty_in: f64,
+    pub novelty_out: f64,
+    pub loopability: f64,
+    pub cue_confidence: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackCues {
@@ -45,6 +66,8 @@ pub struct TrackCues {
     pub first_drop: Option<f64>,
     pub safe_entries: Vec<f64>,
     pub safe_exits: Vec<f64>,
+    #[serde(default)]
+    pub phrase_boundaries: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,11 +170,43 @@ pub struct Transition {
     #[serde(default)]
     pub beat_matched: bool,
     #[serde(default)]
+    pub bar_matched: bool,
+    #[serde(default)]
+    pub phrase_matched: bool,
+    #[serde(default)]
+    pub beat_alignment_error_ms: f64,
+    #[serde(default)]
     pub overlap_bars: u8,
     #[serde(default)]
     pub fade_shape: String,
     #[serde(default)]
     pub spectrum_plan: String,
+    #[serde(default)]
+    pub technique: String,
+    #[serde(default)]
+    pub bass_swap_progress: f64,
+    #[serde(default)]
+    pub vocal_clash_risk: f64,
+    #[serde(default = "one")]
+    pub fade_out_curve: f64,
+    #[serde(default = "one")]
+    pub fade_in_curve: f64,
+    #[serde(default)]
+    pub outgoing_low_db: f64,
+    #[serde(default)]
+    pub incoming_low_db: f64,
+    #[serde(default)]
+    pub outgoing_mid_db: f64,
+    #[serde(default)]
+    pub incoming_mid_db: f64,
+    #[serde(default)]
+    pub outgoing_high_db: f64,
+    #[serde(default)]
+    pub incoming_high_db: f64,
+    #[serde(default)]
+    pub timing_score: f64,
+    #[serde(default)]
+    pub policy_version: String,
     pub style: String,
     pub quality_score: f64,
     #[serde(default)]

@@ -77,6 +77,26 @@ services:
       retries: 12
     restart: unless-stopped
 
+  # Offline only: start explicitly with `docker compose --profile training
+  # run --rm trainer ...`. The service is never part of normal playback, so
+  # the critic/localizer cannot consume runtime resources.
+  trainer:
+    profiles: [training]
+    build:
+      context: ./trainer
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    environment:
+      TRANSITION_DATASET_ROOT: /training
+      TRANSITION_POLICY_OUTPUT: /data/models/transition-policy-v1.json
+      MUSIC_ROOT: /music
+      TRANSITION_TRAIN_DEVICE: ${TRANSITION_TRAIN_DEVICE:-auto}
+    volumes:
+      - ${TRANSITION_TRAINING_PATH:-./.dj-attatouille-training}:/training
+      - appdata:/data
+      - ${TRAINING_INPUT_PATH:-./training-input}:/input:ro
+      - ${MUSIC_LIBRARY_PATH:-./music}:/music:ro
+
   mongo:
     image: mongo:8.0
     command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]

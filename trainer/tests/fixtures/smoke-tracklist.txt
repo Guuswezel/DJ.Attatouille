@@ -1,0 +1,3 @@
+00:00 Smoke track A
+02:00 Smoke track B
+04:00 Smoke track C

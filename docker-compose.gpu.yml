@@ -13,3 +13,17 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  trainer:
+    build:
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu124
+    environment:
+      TRANSITION_TRAIN_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

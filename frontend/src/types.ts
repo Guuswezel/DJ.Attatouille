@@ -7,6 +7,23 @@ export interface Segment {
   energy: number
 }
 
+export interface PhraseState {
+  start: number
+  end: number
+  phraseIndex: number
+  energy: number
+  energySlope: number
+  bassActivity: number
+  drumActivity: number
+  vocalActivity: number
+  spectralDensity: number
+  harmonicDensity: number
+  noveltyIn: number
+  noveltyOut: number
+  loopability: number
+  cueConfidence: number
+}
+
 export interface Track {
   id: string
   relativePath: string
@@ -25,11 +42,13 @@ export interface Track {
   downbeats: number[]
   genres: string[]
   segments: Segment[]
+  phraseStates: PhraseState[]
   cues: {
     introEnd: number
     firstDrop?: number | null
     safeEntries: number[]
     safeExits: number[]
+    phraseBoundaries: number[]
   }
   embeddingIndexed: boolean
 }
@@ -76,9 +95,25 @@ export interface Transition {
   tempoFactor: number
   loopSeconds: number
   beatMatched: boolean
+  barMatched: boolean
+  phraseMatched: boolean
+  beatAlignmentErrorMs: number
   overlapBars: number
   fadeShape?: string
   spectrumPlan: string
+  technique: string
+  bassSwapProgress: number
+  vocalClashRisk: number
+  fadeOutCurve: number
+  fadeInCurve: number
+  outgoingLowDb: number
+  incomingLowDb: number
+  outgoingMidDb: number
+  incomingMidDb: number
+  outgoingHighDb: number
+  incomingHighDb: number
+  timingScore: number
+  policyVersion: string
   style: string
   qualityScore: number
   renderQualityScore?: number | null

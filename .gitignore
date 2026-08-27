@@ -10,6 +10,10 @@ worker/app/__pycache__/
 .dj-attatouille-data/
 
 .venv-mps/
+.tools/
+.dj-attatouille-training/
+training-input/*
+!training-input/README.md
 
 worker/demix/htdemucs/
 worker/spec/
