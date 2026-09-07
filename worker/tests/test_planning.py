@@ -6,23 +6,31 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+from pydub import AudioSegment
 
 from app.main import (
     TRANSITION_POLICY_FEATURES,
+    analyse_track,
     detailed_waveform,
+    fade_gains,
     gain_trim_db,
     harmonix_device,
     harmonix_model_name,
     harmonix_proxy_stems,
+    ordered_tracks,
+    overlay_with_headroom,
     phrase_state_boundaries,
     project_embedding,
+    read_analysis_cache,
     repaired_downbeat_grid,
     report_preparation_progress,
     resolve_music_source,
     safe_exit_for,
+    transition_compatibility_score,
     transition_between,
     transition_policy_controls,
     waveform_points,
+    write_analysis_cache,
 )
 
 
@@ -69,6 +77,67 @@ class TransitionPlanningTests(unittest.TestCase):
         self.assertGreaterEqual(selected, 102)
         self.assertLessEqual(selected, 132)
 
+    def test_duration_preference_selects_different_safe_phrases(self) -> None:
+        source = track("journey", 120, "C", 0.5)
+        source["segments"] = [{"start": 0.0, "end": 240.0, "label": "verse", "energy": 0.5}]
+        short = safe_exit_for(source, 0, 32, 112, duration_preference=0.2)
+        long = safe_exit_for(source, 0, 32, 112, duration_preference=0.8)
+        self.assertIsNotNone(short)
+        self.assertIsNotNone(long)
+        assert short is not None and long is not None
+        self.assertLess(short, long)
+
+    def test_exit_avoids_a_sustained_vocal_tail(self) -> None:
+        source = track("vocal", 120, "C", 0.5)
+        source["segments"] = [{"start": 0.0, "end": 240.0, "label": "verse", "energy": 0.5}]
+        risky = next(state for state in source["phraseStates"] if state["end"] == 64.0)
+        risky.update({"vocalActivity": 1.0, "vocalTailActivity": 1.0, "vocalContinuity": 1.0})
+        selected = safe_exit_for(source, 0, 50, 90, duration_preference=0.2)
+        self.assertEqual(selected, 80.0)
+
+    def test_energy_order_is_monotonic_across_genres(self) -> None:
+        candidates = [track(f"track-{index}", 120, "C", energy) for index, energy in enumerate([0.8, 0.2, 0.6, 0.4])]
+        for candidate, genre in zip(candidates, ["techno", "ambient", "house", "disco"]):
+            candidate["genres"] = [genre]
+        energies = [item["energy"] for item in ordered_tracks(candidates)]
+        self.assertEqual(energies, [0.2, 0.4, 0.6, 0.8])
+
+    def test_energy_order_ignores_genre_even_when_the_old_journey_conflicts(self) -> None:
+        warmup = track("warmup", 110, "C", 0.20)
+        peak = track("peak", 132, "C", 0.90)
+        warmup["genres"], peak["genres"] = ["techno"], ["ambient"]
+        self.assertEqual([item["id"] for item in ordered_tracks([peak, warmup])], ["warmup", "peak"])
+
+    def test_float_overlay_applies_headroom_before_pcm_saturation(self) -> None:
+        samples = np.full(2_048, 29_000, dtype=np.int16)
+        outgoing = AudioSegment(samples.tobytes(), frame_rate=44_100, sample_width=2, channels=1)
+        bridge, metrics = overlay_with_headroom(outgoing, outgoing, ceiling_dbfs=-2.0)
+        self.assertLess(metrics["preOverlayPeakDbfs"], 6.0)
+        self.assertLess(metrics["overlayGainDb"], -3.0)
+        self.assertLessEqual(bridge.max_dBFS, -1.95)
+
+    def test_professional_compatibility_target_can_reward_controlled_contrast(self) -> None:
+        first = track("one", 120, "C", 0.4)
+        second = track("two", 120, "C", 0.7)
+        outgoing = first["phraseStates"][4]
+        incoming = second["phraseStates"][4].copy()
+        outgoing["energy"] = 0.4
+        incoming["energy"] = 0.7
+        features = {
+            name: {"weight": 1.0 if name == "energy" else 0.0, "targetDelta": 0.3, "scale": 0.05}
+            for name in ("energy", "trajectory", "bass", "drums", "vocals", "spectral", "harmonic", "novelty")
+        }
+        with patch("app.main.load_transition_policy", return_value={"compatibilityProfile": {"features": features}}):
+            score, components = transition_compatibility_score(first, second, outgoing, incoming)
+        self.assertGreater(score, 0.99)
+        self.assertGreater(components["energy"], 0.99)
+
+    def test_vocal_carry_does_not_fade_the_sentence_at_mid_phrase(self) -> None:
+        vocal_out, _ = fade_gains(0.5, "vocal-carry", 0.7, 0.7)
+        regular_out, _ = fade_gains(0.5, "equal-power", 1.0, 1.0)
+        self.assertGreater(vocal_out, -0.1)
+        self.assertLess(regular_out, -2.5)
+
     @patch("app.main.vector_score", return_value=0.8)
     def test_transition_uses_pitch_preserving_beat_overlay_when_bpm_is_close(self, _: object) -> None:
         plan = transition_between(track("one", 120, "C", 0.5), track("two", 124, "G", 0.6), 0, 90, 150)
@@ -80,7 +149,8 @@ class TransitionPlanningTests(unittest.TestCase):
         self.assertTrue(plan["barMatched"])
         self.assertTrue(plan["phraseMatched"])
         self.assertEqual(plan["overlapBars"], 8)
-        self.assertLessEqual(plan["beatAlignmentErrorMs"], 45)
+        self.assertLessEqual(plan["beatAlignmentErrorMs"], 22)
+        self.assertLessEqual(plan["beatPhaseErrorMs"], 22)
         self.assertGreaterEqual(plan["exitAtSeconds"], 90)
         self.assertLessEqual(plan["exitAtSeconds"], 150)
         self.assertIn("renderQualityScore", plan)
@@ -175,9 +245,20 @@ class TransitionPlanningTests(unittest.TestCase):
         self.assertEqual(max(points), 1.0)
         self.assertEqual(points[0], 0.0)
 
-    def test_detailed_waveform_keeps_sixteen_samples_per_beat(self) -> None:
+    def test_waveform_detail_never_appends_empty_bins_when_more_points_are_requested(self) -> None:
+        points = waveform_points(np.array([0.0, 0.5, 1.0, 0.25]), count=8)
+        self.assertEqual(len(points), 8)
+        self.assertEqual(max(points), 1.0)
+        # The old array_split implementation put four samples at the beginning
+        # and four zero bins at the end, which stretched the visual timeline.
+        self.assertGreater(points[-1], 0.0)
+        self.assertGreater(points[-2], 0.0)
+
+    def test_detailed_waveform_keeps_sixty_four_samples_per_beat(self) -> None:
         encoded = detailed_waveform(np.array([0.0, 0.5, 1.0, 0.25]), duration=120.0, bpm=150.0, detected_beats=300)
-        self.assertEqual(len(base64.b64decode(encoded)), 4_800)
+        values = base64.b64decode(encoded)
+        self.assertEqual(len(values), 19_200)
+        self.assertGreater(values[-1], 0)
 
     def test_phrase_clock_uses_eight_bar_big_one_boundaries(self) -> None:
         downbeats = np.arange(0.0, 130.0, 2.0)
@@ -226,7 +307,7 @@ class TransitionPlanningTests(unittest.TestCase):
         report_preparation_progress(
             "prep id", progress=105, discovered_track_count=7,
             analysed_track_count=3, failed_track_count=1, current_track="four.mp3",
-            message="Analysing track 5 of 7",
+            message="Analysing track 5 of 7", cached_track_count=2,
         )
         request = mocked_open.call_args.args[0]  # type: ignore[attr-defined]
         self.assertEqual(request.full_url, "http://api/api/preparations/prep%20id/progress")
@@ -235,7 +316,46 @@ class TransitionPlanningTests(unittest.TestCase):
         self.assertEqual(payload["discoveredTrackCount"], 7)
         self.assertEqual(payload["analysedTrackCount"], 3)
         self.assertEqual(payload["failedTrackCount"], 1)
+        self.assertEqual(payload["cachedTrackCount"], 2)
         self.assertEqual(payload["currentTrack"], "four.mp3")
+
+    def test_completed_track_cache_is_reused_without_decoding_or_harmonix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            music_root = root / "music"
+            data_root = root / "data"
+            song = music_root / "Party" / "song.mp3"
+            song.parent.mkdir(parents=True)
+            song.write_bytes(b"unchanged source audio")
+            cached_track = {
+                "relativePath": "Party/song.mp3", "title": "Cached song", "artist": "Artist",
+                "album": "Album", "durationSeconds": 180.0, "bpm": 124.0, "key": "Am",
+                "energy": 0.7, "loudnessLufs": -14.0, "waveform": [0.2, 0.8],
+                "waveformDetail": None, "beatGrid": [0.0, 0.484], "downbeats": [0.0],
+                "genres": ["house"], "segments": [], "phraseStates": [],
+                "cues": {"introEnd": 0.0, "firstDrop": None, "safeEntries": [0.0],
+                         "safeExits": [176.0], "phraseBoundaries": [0.0, 176.0]},
+            }
+            vector = np.ones(512, dtype=np.float32) / np.sqrt(512)
+            with patch("app.main.MUSIC_ROOT", music_root), patch("app.main.DATA_ROOT", data_root):
+                write_analysis_cache(song, cached_track, vector)
+                self.assertIsNotNone(read_analysis_cache(song))
+                tags = ({"title": "Tagged", "artist": "Artist", "album": "Album"}, ["house"], "/artwork/new")
+                with patch("app.main.tags_for", return_value=tags), \
+                     patch("app.main.index_vector", return_value=True), \
+                     patch("app.main.librosa.load") as load_audio, \
+                     patch("app.main.harmonix") as run_harmonix:
+                    restored, source = analyse_track(song, "new-preparation")
+                load_audio.assert_not_called()
+                run_harmonix.assert_not_called()
+                self.assertEqual(source, "cache")
+                self.assertEqual(restored["title"], "Cached song")
+                self.assertEqual(restored["artworkUrl"], "/artwork/new")
+                self.assertTrue(restored["embeddingIndexed"])
+
+                # A changed source must not accidentally inherit stale features.
+                song.write_bytes(b"changed source audio with a different size")
+                self.assertIsNone(read_analysis_cache(song))
 
     @patch("app.main.ANALYSIS_DEVICE", "mps")
     @patch("torch.cuda.is_available", return_value=False)

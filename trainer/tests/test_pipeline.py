@@ -37,7 +37,7 @@ from dj_train.models import (
     export_policy,
 )
 from dj_train.tracklist import parse_tracklist
-from dj_train.train import collate_common_fields
+from dj_train.train import collate_common_fields, learn_compatibility_profile
 
 
 def signal(frequency: float = 110.0) -> np.ndarray:
@@ -148,6 +148,35 @@ class CanonicalRepresentationTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_professional_contexts_learn_normalised_feature_weights_and_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sample_dir = root / "samples" / "professional"
+            sample_dir.mkdir(parents=True)
+            rows = []
+            for index in range(6):
+                mir = np.zeros((TOTAL_BARS, MIR_DIM), dtype=np.float32)
+                outgoing_energy = 0.08 + index * 0.12
+                mir[:8, 0] = outgoing_energy
+                mir[-8:, 0] = outgoing_energy + 0.05
+                mir[:8, 2] = 0.15 + index * 0.08
+                mir[-8:, 2] = 0.20 + index * 0.08
+                mir[:8, 10] = mir[-8:, 10] = 0.7
+                mir[:8, 11] = mir[-8:, 11] = 0.2
+                mir[:8, 12 + index] = 1.0
+                mir[-8:, 12 + index] = 1.0
+                relative = Path("samples") / "professional" / f"{index}.npz"
+                np.savez_compressed(root / relative, mir=mir, bar_mask=np.ones(TOTAL_BARS, dtype=np.float32))
+                rows.append({"id": str(index), "domain": "professional", "sample": str(relative)})
+            (root / "manifest.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+            )
+            profile = learn_compatibility_profile(root)
+        weights = [item["weight"] for item in profile["features"].values()]
+        self.assertEqual(profile["sampleCount"], 6)
+        self.assertAlmostEqual(sum(weights), 1.0, places=5)
+        self.assertAlmostEqual(profile["features"]["energy"]["targetDelta"], 0.05, places=4)
+
     def test_localizer_backpropagates_through_temporal_context_features(self) -> None:
         model = TransitionLocalizer(width=32)
         mel = torch.zeros(2, TOTAL_BARS, MEL_BINS)

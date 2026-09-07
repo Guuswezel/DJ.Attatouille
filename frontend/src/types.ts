@@ -38,6 +38,7 @@ export interface Track {
   loudnessLufs?: number | null
   waveform: number[]
   waveformDetail?: string | null
+  waveformDetailVersion?: number | null
   beatGrid: number[]
   downbeats: number[]
   genres: string[]
@@ -64,6 +65,7 @@ export interface Preparation {
   discoveredTrackCount: number
   analysedTrackCount: number
   failedTrackCount: number
+  cachedTrackCount: number
   currentTrack?: string | null
   genres: string[]
   tracks: Track[]
@@ -79,7 +81,6 @@ export interface Preparation {
 
 export interface MixOptions {
   preparationId: string
-  genreOrder: string[]
   minTrackSeconds: number
   maxTrackSeconds: number
   acceptancePercentage: number
@@ -117,6 +118,8 @@ export interface Transition {
   style: string
   qualityScore: number
   renderQualityScore?: number | null
+  preOverlayPeakDbfs?: number | null
+  overlayGainDb?: number | null
   notes: string[]
 }
 

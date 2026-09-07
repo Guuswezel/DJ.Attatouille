@@ -349,7 +349,7 @@ def policy_features_from_decks(
     incoming_entry_fraction: float = 0.18,
     genre_compatibility: float = 0.5,
 ) -> np.ndarray:
-    """Build the same 24-value semantic state consumed by the live policy."""
+    """Build the same semantic state consumed by the live policy."""
     _, outgoing_mir = features_from_bars(outgoing)
     _, incoming_mir = features_from_bars(incoming)
     out = np.mean(outgoing_mir[max(0, CONTEXT_BEFORE_BARS - 8):CONTEXT_BEFORE_BARS + 8], axis=0)

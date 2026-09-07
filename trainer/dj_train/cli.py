@@ -118,15 +118,15 @@ def run(args: argparse.Namespace) -> Any:
         for stage in stages:
             if stage == "localizer":
                 reports.append(train_localizer(
-                    root, epochs=args.epochs or 20, batch_size=args.batch_size or 8, device_name=args.device,
+                    root, epochs=args.epochs or 36, batch_size=args.batch_size or 8, device_name=args.device,
                 ))
             elif stage == "critic":
                 reports.append(train_critic(
-                    root, epochs=args.epochs or 24, batch_size=args.batch_size or 8, device_name=args.device,
+                    root, epochs=args.epochs or 48, batch_size=args.batch_size or 8, device_name=args.device,
                 ))
             else:
                 reports.append(train_policy(
-                    root, epochs=args.epochs or 30, batch_size=args.batch_size or 2,
+                    root, epochs=args.epochs or 72, batch_size=args.batch_size or 2,
                     device_name=args.device, policy_output=args.policy_output,
                 ))
         return reports

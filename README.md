@@ -1,6 +1,6 @@
 # DJ.Attatouille
 
-A local-first, standalone music player for small parties. It prepares a mounted music library, plans a genre-led mix, renders a continuous MP3 with monitored transitions, and serves a responsive two-deck player.
+A local-first, standalone music player for small parties. It prepares a mounted music library, plans an energy-led mix, renders a continuous MP3 with monitored transitions, and serves a responsive two-deck player.
 
 No API key is required and music is never uploaded. MongoDB stores preparation and mix records; Qdrant stores local music embeddings for transition similarity search.
 
@@ -16,7 +16,7 @@ The app can prepare `/music` or any nested folder such as `/music/Friday`. Multi
 ## What preparation extracts
 
 - Metadata and embedded cover art
-- BPM, musical key, EBU R128 integrated loudness, energy, beat/downbeat/bar grids, explicit eight-bar phrase states, a compact waveform envelope, and a high-resolution 8-bit signal with at least 16 samples per beat
+- BPM, musical key, EBU R128 integrated loudness, energy, beat/downbeat/bar grids, explicit eight-bar phrase states, a compact waveform envelope, and a high-resolution 8-bit signal with 64 samples per beat
 - Genres from tags, with an offline acoustic fallback
 - A 512D track vector in Qdrant, derived from Harmonix/all-in-one embeddings where available and MFCC/chroma/spectral features otherwise
 
@@ -67,7 +67,7 @@ Current PyTorch MPS cannot execute one large HTDemucs convolution. The default f
 
 ## Mix and playback behavior
 
-The mix form lets a user drag genres into the desired journey, select the minimum/maximum time on deck, and choose the lowest acceptable percentage of tracks to keep. Preparation establishes an explicit eight-bar phrase clock from the downbeat grid, anchored by learned structure changes. Each phrase persists its energy/slope, bass, drums, vocal-band activity, spectral/harmonic density, novelty, loopability, and cue confidence. The controller pairs outgoing and incoming phrase states while protecting the middle of drops, peaks, and builds.
+The mix form sequences the full crate from warm-up to peak energy, then selects the minimum/maximum time on deck and the lowest acceptable percentage of tracks to keep. Genre remains descriptive metadata and a low-weight compatibility input, never a sequencing bucket. Preparation establishes an explicit eight-bar phrase clock from the downbeat grid, anchored by learned structure changes. Each phrase persists its energy/slope, bass, drums, vocal-band activity, spectral/harmonic density, novelty, loopability, and cue confidence. The controller pairs outgoing and incoming phrase states while protecting the middle of drops, peaks, and builds.
 
 Tempo corrections use FFmpeg's pitch-preserving `atempo` filter—never a sample-rate change—so BPM changes do not shift voices, keys, or other frequencies. An overlapping transition is allowed only when beat phase, bar phase, and both eight-bar phrase endpoints lock. Tempo is derived from the actual detected phrase spans; the 95th-percentile rendered beat-grid residual must stay below 45 ms. Valid transitions use a full eight-bar deterministic EQ blend with one bass owner and a smooth bass swap. If that timing gate fails, the records meet at a phrase boundary without overlapping drifting kick grids. Every rendered overlap is level/clipping monitored before the mix is marked ready.
 

@@ -120,7 +120,7 @@ def apply_localizer(root: Path, model: TransitionLocalizer, device: torch.device
 def train_localizer(
     root: Path,
     *,
-    epochs: int = 20,
+    epochs: int = 36,
     batch_size: int = 8,
     device_name: str = "auto",
 ) -> dict[str, Any]:
@@ -192,7 +192,7 @@ def _critic_auxiliary_targets(mir: torch.Tensor) -> torch.Tensor:
 def train_critic(
     root: Path,
     *,
-    epochs: int = 24,
+    epochs: int = 48,
     batch_size: int = 8,
     device_name: str = "auto",
 ) -> dict[str, Any]:
@@ -214,12 +214,25 @@ def train_critic(
                 [domain == "professional" for domain in batch["domain"]],
                 device=device, dtype=torch.float32,
             )
-            realism_loss = F.binary_cross_entropy_with_logits(output["realism"], professional)
+            realism_terms = F.binary_cross_entropy_with_logits(
+                output["realism"], professional, reduction="none",
+            )
+            # Synthetic examples are technically legal deck pairs, so make a
+            # false "professional" judgement on one costlier than a comparable
+            # positive example. This focuses capacity on subtle bad blends.
+            realism_weights = torch.where(professional > 0.5, 1.0, 1.35)
+            realism_loss = (realism_terms * realism_weights).mean()
             auxiliary_targets = _critic_auxiliary_targets(mir)
-            auxiliary_loss = F.binary_cross_entropy_with_logits(output["auxiliary"], auxiliary_targets)
+            auxiliary_terms = F.binary_cross_entropy_with_logits(
+                output["auxiliary"], auxiliary_targets, reduction="none",
+            )
+            auxiliary_weights = torch.tensor(
+                [1.30, 1.20, 1.55, 1.15, 1.00, 1.05], device=device,
+            )
+            auxiliary_loss = (auxiliary_terms * auxiliary_weights).mean()
             location_target = batch["transition_target"].to(device=device, dtype=torch.float32)
             location_loss = F.binary_cross_entropy_with_logits(output["location"], location_target)
-            loss = realism_loss + 0.40 * auxiliary_loss + 0.20 * location_loss
+            loss = realism_loss + 0.48 * auxiliary_loss + 0.24 * location_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 2.0)
@@ -245,10 +258,126 @@ def _load_critic(root: Path, device: torch.device) -> TransitionCritic:
     return critic
 
 
+def _professional_context_descriptors(mir: np.ndarray, bar_mask: np.ndarray) -> dict[str, np.ndarray | float]:
+    """Approximate the two decks from clean context around a pro transition.
+
+    Tracklists do not provide isolated deck audio. The first and last eight
+    valid bars are nevertheless useful proxies: they are furthest away from
+    the crossfade and have exactly the same MIR representation as synthetic
+    samples. This lets the runtime learn which kinds of continuity (or
+    contrast) professionals actually choose without pretending to recover
+    source stems from a mastered set.
+    """
+    valid = np.flatnonzero(np.asarray(bar_mask) > 0)
+    if valid.size < 16:
+        raise ValueError("Professional sample does not contain enough valid context bars")
+    context = min(8, valid.size // 2)
+    outgoing = np.mean(mir[valid[:context]], axis=0)
+    incoming = np.mean(mir[valid[-context:]], axis=0)
+    return {
+        "energy": float(outgoing[0]), "incoming_energy": float(incoming[0]),
+        "trajectory": float(outgoing[1]), "incoming_trajectory": float(incoming[1]),
+        "bass": float(outgoing[2]), "incoming_bass": float(incoming[2]),
+        "drums": float(outgoing[10]), "incoming_drums": float(incoming[10]),
+        "vocals": float(outgoing[11]), "incoming_vocals": float(incoming[11]),
+        "spectral": outgoing[6:9].astype(np.float32),
+        "incoming_spectral": incoming[6:9].astype(np.float32),
+        "harmonic": outgoing[12:24].astype(np.float32),
+        "incoming_harmonic": incoming[12:24].astype(np.float32),
+        "novelty": float(outgoing[5]), "incoming_novelty": float(incoming[5]),
+    }
+
+
+def _descriptor_delta(outgoing: dict[str, np.ndarray | float], incoming: dict[str, np.ndarray | float]) -> dict[str, float]:
+    def scalar(name: str) -> float:
+        return abs(float(outgoing[name]) - float(incoming[f"incoming_{name}"]))
+
+    first_chroma = np.asarray(outgoing["harmonic"], dtype=np.float32)
+    second_chroma = np.asarray(incoming["incoming_harmonic"], dtype=np.float32)
+    chroma_denominator = float(np.linalg.norm(first_chroma) * np.linalg.norm(second_chroma))
+    harmonic_distance = 1.0 if chroma_denominator < 1e-8 else 1.0 - float(
+        np.clip(np.dot(first_chroma, second_chroma) / chroma_denominator, 0, 1)
+    )
+    spectral_distance = float(
+        np.linalg.norm(
+            np.asarray(outgoing["spectral"], dtype=np.float32)
+            - np.asarray(incoming["incoming_spectral"], dtype=np.float32)
+        ) / math.sqrt(3)
+    )
+    return {
+        "energy": scalar("energy"),
+        "trajectory": scalar("trajectory"),
+        "bass": scalar("bass"),
+        "drums": scalar("drums"),
+        "vocals": scalar("vocals"),
+        "spectral": spectral_distance,
+        "harmonic": harmonic_distance,
+        "novelty": scalar("novelty"),
+    }
+
+
+def learn_compatibility_profile(root: Path) -> dict[str, Any]:
+    """Learn feature importance and preferred deltas from professional sets.
+
+    Positive deltas pair the contexts on either side of a real transition.
+    Deterministic shuffled pairs approximate arbitrary track choices. A feature
+    receives more weight when professional choices differ measurably from those
+    arbitrary pairs. The learned target can be non-zero, so the planner can
+    prefer deliberate energy/spectral contrast instead of always maximizing
+    raw similarity.
+    """
+    descriptors: list[dict[str, np.ndarray | float]] = []
+    for row in read_rows(root):
+        if row.get("domain") != "professional":
+            continue
+        with np.load(root / row["sample"], allow_pickle=False) as stored:
+            try:
+                descriptors.append(_professional_context_descriptors(
+                    stored["mir"].astype(np.float32), stored["bar_mask"].astype(np.float32),
+                ))
+            except (KeyError, ValueError):
+                continue
+    if len(descriptors) < 4:
+        raise ValueError("At least four professional transitions are required to learn compatibility weights")
+
+    positive = [_descriptor_delta(item, item) for item in descriptors]
+    offset = max(1, len(descriptors) // 2)
+    negative = [
+        _descriptor_delta(item, descriptors[(index + offset) % len(descriptors)])
+        for index, item in enumerate(descriptors)
+    ]
+    raw_weights: dict[str, float] = {}
+    statistics: dict[str, dict[str, float]] = {}
+    for name in positive[0]:
+        positives = np.asarray([item[name] for item in positive], dtype=np.float32)
+        negatives = np.asarray([item[name] for item in negative], dtype=np.float32)
+        target = float(np.median(positives))
+        deviation = np.abs(positives - target)
+        scale = max(0.035, float(np.percentile(deviation, 75)) * 1.4826)
+        separation = abs(float(np.median(negatives)) - target) / max(
+            scale + float(np.median(np.abs(negatives - np.median(negatives)))), 0.035,
+        )
+        raw_weights[name] = float(np.clip(separation, 0.05, 4.0))
+        statistics[name] = {
+            "targetDelta": round(target, 6),
+            "scale": round(scale, 6),
+            "randomPairMedian": round(float(np.median(negatives)), 6),
+        }
+    total = sum(raw_weights.values())
+    for name, values in statistics.items():
+        values["weight"] = round(raw_weights[name] / max(total, 1e-8), 6)
+    return {
+        "schemaVersion": 1,
+        "method": "professional-context-contrast-v1",
+        "sampleCount": len(descriptors),
+        "features": statistics,
+    }
+
+
 def train_policy(
     root: Path,
     *,
-    epochs: int = 30,
+    epochs: int = 72,
     batch_size: int = 2,
     device_name: str = "auto",
     policy_output: Path = POLICY_OUTPUT,
@@ -278,10 +407,18 @@ def train_policy(
             rendered = mixer(outgoing, incoming, controls)
             mel, mir = projector(rendered)
             output = critic(mel, mir, torch.ones(rendered.shape[0], TOTAL_BARS, device=device))
+            realism = torch.sigmoid(output["realism"])
             adversarial = F.softplus(-output["realism"]).mean()
-            diagnostics = F.binary_cross_entropy_with_logits(
-                output["auxiliary"], torch.ones_like(output["auxiliary"]),
+            # Put extra curvature on clearly bad transition candidates rather
+            # than allowing a tiny control gain to trade away naturalness.
+            bad_transition_penalty = F.relu(0.78 - realism).square().mean()
+            diagnostic_terms = F.binary_cross_entropy_with_logits(
+                output["auxiliary"], torch.ones_like(output["auxiliary"]), reduction="none",
             )
+            diagnostic_weights = torch.tensor(
+                [1.30, 1.20, 1.80, 1.20, 1.00, 1.05], device=device,
+            )
+            diagnostics = (diagnostic_terms * diagnostic_weights).mean()
             peak_penalty = F.relu(rendered.abs().amax(dim=(1, 2)) - 0.98).mean()
             # Keep the relaxed phrase count near a legal 8-bar multiple.  The
             # live planner quantizes it and re-runs its hard residual gates.
@@ -299,8 +436,8 @@ def train_policy(
             control_range = (policy.control_upper - policy.control_lower).clamp_min(1e-4)
             prior_cost = ((controls - baseline) / control_range).square().mean()
             loss = (
-                adversarial + 0.35 * diagnostics + 2.0 * peak_penalty
-                + 0.08 * phrase_integer + 0.05 * bass_collision + loop_cost
+                adversarial + 0.80 * bad_transition_penalty + 0.48 * diagnostics + 2.0 * peak_penalty
+                + 0.10 * phrase_integer + 0.12 * bass_collision + loop_cost
                 + 0.12 * prior_cost + 0.15 * timing_calibration
             )
             optimizer.zero_grad(set_to_none=True)
@@ -317,20 +454,24 @@ def train_policy(
         _report_epoch("policy", epoch, epochs, final_loss)
     checkpoint = _checkpoint_path(root, "policy.pt")
     torch.save({"model": policy.state_dict(), "epochs": epochs, "loss": final_loss}, checkpoint)
+    compatibility_profile = learn_compatibility_profile(root)
     export_policy(
         policy,
         policy_output,
         {
-            "policyVersion": "transition-policy-v1",
+            "policyVersion": "transition-policy-v2",
             "epochs": epochs,
             "loss": final_loss,
+            "badTransitionPenalty": "critic-realism<0.78, weighted bass/phrase diagnostics",
             "professionalSamples": sum(row["domain"] == "professional" for row in read_rows(root)),
             "syntheticSamples": len(dataset),
         },
+        compatibility_profile,
     )
     return {
         "stage": "policy", "device": str(device), "epochs": epochs, "loss": final_loss,
         "checkpoint": str(checkpoint), "export": str(policy_output),
+        "compatibilityProfile": compatibility_profile,
     }
 
 

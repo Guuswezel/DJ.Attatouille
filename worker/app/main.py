@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -47,6 +48,14 @@ HARMONIX_PROXY_SAMPLE_RATE = min(
 )
 HARMONIX_MODEL_SAMPLE_RATE = 44_100
 PHRASE_BARS = 8
+BEAT_ANCHOR_TOLERANCE_SECONDS = 0.035
+# A double kick becomes noticeable well before the previous 45 ms tolerance.
+# This is deliberately a hard gate: when a reliable grid cannot maintain this
+# residual, a short phrase-boundary hand-off is more musical than a drifting
+# overlay.
+MAX_BEAT_OVERLAY_RESIDUAL_MS = 22.0
+WAVEFORM_SAMPLES_PER_BEAT = 64
+WAVEFORM_DETAIL_VERSION = 2
 VECTOR_COLLECTION = "track_embeddings"
 VECTOR_SIZE = 512
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
@@ -55,6 +64,10 @@ DJ_TARGET_LUFS = float(os.environ.get("DJ_TARGET_LUFS", "-14"))
 DJ_MAX_TRIM_DB = float(os.environ.get("DJ_MAX_TRIM_DB", "8"))
 MASTER_TARGET_DBFS = float(os.environ.get("MASTER_TARGET_DBFS", "-14"))
 MASTER_CEILING_DBFS = float(os.environ.get("MASTER_CEILING_DBFS", "-1"))
+# Keep one extra dB before the final master limiter. Unlike a limiter applied
+# after AudioSegment.overlay, this guard runs on the two floating-point deck
+# signals before they can saturate their integer PCM container.
+TRANSITION_OVERLAY_CEILING_DBFS = min(-1.0, MASTER_CEILING_DBFS - 1.0)
 TRANSITION_POLICY_PATH = Path(
     os.environ.get("TRANSITION_POLICY_PATH", str(DATA_ROOT / "models" / "transition-policy-v1.json"))
 ).resolve()
@@ -79,6 +92,22 @@ HARMONIX_MODELS_LOCK = threading.Lock()
 HARMONIX_INFERENCE_LOCK = threading.Lock()
 TRANSITION_POLICY_CACHE: tuple[int, dict[str, Any] | None] = (-1, None)
 TRANSITION_POLICY_LOCK = threading.Lock()
+DEFAULT_COMPATIBILITY_PROFILE = {
+    "energy": {"weight": 0.19, "targetDelta": 0.10, "scale": 0.24},
+    "trajectory": {"weight": 0.14, "targetDelta": 0.12, "scale": 0.34},
+    "bass": {"weight": 0.13, "targetDelta": 0.10, "scale": 0.25},
+    "drums": {"weight": 0.10, "targetDelta": 0.10, "scale": 0.27},
+    "vocals": {"weight": 0.13, "targetDelta": 0.20, "scale": 0.30},
+    "spectral": {"weight": 0.11, "targetDelta": 0.12, "scale": 0.28},
+    "harmonic": {"weight": 0.07, "targetDelta": 0.10, "scale": 0.30},
+    "novelty": {"weight": 0.13, "targetDelta": 0.16, "scale": 0.34},
+}
+DURATION_JOURNEY = (0.58, 0.32, 0.74, 0.46, 0.84, 0.27, 0.66, 0.40)
+# v5 fixes a timeline bug in the prior high-resolution waveform encoder: it
+# asked an ~43 fps RMS feature stream for 64 samples per beat, producing more
+# bins than frames and leaving a stretched tail of zero-valued samples.  The
+# new envelope is binned directly from the decoded audio timeline.
+ANALYSIS_CACHE_VERSION = "track-analysis-v5-source-timed-waveform"
 
 
 def jsonable(value: Any) -> Any:
@@ -125,6 +154,7 @@ def report_preparation_progress(
     failed_track_count: int,
     current_track: str | None,
     message: str,
+    cached_track_count: int = 0,
 ) -> None:
     """Publish best-effort, local progress without delaying audio analysis.
 
@@ -139,6 +169,7 @@ def report_preparation_progress(
         "discoveredTrackCount": max(0, int(discovered_track_count)),
         "analysedTrackCount": max(0, int(analysed_track_count)),
         "failedTrackCount": max(0, int(failed_track_count)),
+        "cachedTrackCount": max(0, int(cached_track_count)),
         "currentTrack": current_track,
         "message": message,
     }
@@ -190,14 +221,77 @@ def index_vector(track_id: str, vector: np.ndarray, payload: dict[str, Any]) -> 
 
 
 def get_vector(track_id: str) -> np.ndarray | None:
+    point = get_indexed_track(track_id)
+    return point[0] if point else None
+
+
+def get_indexed_track(track_id: str) -> tuple[np.ndarray, dict[str, Any]] | None:
     result = qdrant_request("POST", f"/collections/{VECTOR_COLLECTION}/points", {
-        "ids": [track_id], "with_vector": True, "with_payload": False,
+        "ids": [track_id], "with_vector": True, "with_payload": True,
     })
     points = (result or {}).get("result", [])
     if not points:
         return None
     vector = points[0].get("vector")
-    return np.array(vector, dtype=np.float32) if vector else None
+    if not vector:
+        return None
+    return np.asarray(vector, dtype=np.float32), dict(points[0].get("payload") or {})
+
+
+def analysis_cache_key(path: Path) -> str:
+    """Fingerprint source bytes plus every setting that changes analysis."""
+    stat = path.stat()
+    try:
+        relative = path.resolve().relative_to(MUSIC_ROOT).as_posix()
+    except ValueError:
+        relative = path.resolve().as_posix()
+    descriptor = {
+        "version": ANALYSIS_CACHE_VERSION,
+        "relativePath": relative,
+        "size": stat.st_size,
+        "mtimeNs": stat.st_mtime_ns,
+        "analysisModel": ANALYSIS_MODEL,
+        "harmonixModel": HARMONIX_MODEL or "device-default",
+        "harmonixProfile": HARMONIX_PROFILE,
+        "analysisSampleRate": ANALYSIS_SAMPLE_RATE,
+        "proxySampleRate": HARMONIX_PROXY_SAMPLE_RATE,
+    }
+    return hashlib.sha256(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()
+
+
+def analysis_cache_path(path: Path) -> Path:
+    return DATA_ROOT / "analysis-cache" / f"{analysis_cache_key(path)}.json"
+
+
+def read_analysis_cache(path: Path) -> tuple[dict[str, Any], np.ndarray] | None:
+    try:
+        payload = json.loads(analysis_cache_path(path).read_text(encoding="utf-8"))
+        if payload.get("version") != ANALYSIS_CACHE_VERSION:
+            return None
+        track = payload["track"]
+        vector = np.asarray(payload["embedding"], dtype=np.float32)
+        if not isinstance(track, dict) or vector.shape != (VECTOR_SIZE,) or not np.isfinite(vector).all():
+            return None
+        return track, vector
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def write_analysis_cache(path: Path, track: dict[str, Any], vector: np.ndarray) -> None:
+    """Atomically persist one completed track before advancing to the next."""
+    destination = analysis_cache_path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    template = dict(track)
+    for key in ("id", "artworkUrl", "embeddingIndexed"):
+        template.pop(key, None)
+    payload = {
+        "version": ANALYSIS_CACHE_VERSION,
+        "track": template,
+        "embedding": np.asarray(vector, dtype=np.float32).tolist(),
+    }
+    temporary = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(jsonable(payload), allow_nan=False), encoding="utf-8")
+    temporary.replace(destination)
 
 
 def normalise_genre(value: str) -> str:
@@ -569,25 +663,44 @@ def beat_safe_points(
     return entries, exits
 
 
-def waveform_points(rms: np.ndarray, count: int = 512) -> list[float]:
-    """Create the compact overview waveform for the player UI."""
-    if not rms.size:
+def waveform_points(signal: np.ndarray, count: int = 512) -> list[float]:
+    """Create an amplitude envelope whose bins span the exact source timeline.
+
+    ``np.array_split`` is only safe while the source contains at least as many
+    frames as requested display points.  A detailed 64-samples-per-beat view
+    exceeds the low-rate RMS frame count, which used to compress the real
+    signal into the beginning of the display and append zero bins.  Binning
+    decoded PCM directly preserves the source-time mapping used by beatGrid.
+    """
+    values = np.asarray(signal, dtype=np.float32).reshape(-1)
+    count = max(1, int(count))
+    if not values.size:
         return [0.0] * count
-    chunks = np.array_split(rms, count)
-    points = np.asarray([float(np.max(chunk)) if chunk.size else 0.0 for chunk in chunks])
+    magnitude = np.abs(values)
+    if values.size < count:
+        # This is mainly useful for tiny unit-test signals and protects callers
+        # that provide a feature stream instead of PCM. Interpolation retains
+        # the full timeline rather than appending empty chunks.
+        positions = np.linspace(0, values.size - 1, count, dtype=np.float32)
+        points = np.interp(positions, np.arange(values.size), magnitude)
+    else:
+        boundaries = np.linspace(0, values.size, count + 1, dtype=np.int64)
+        squared = np.square(values)
+        sums = np.add.reduceat(squared, boundaries[:-1])
+        points = np.sqrt(sums / np.maximum(1, np.diff(boundaries)))
     peak = float(points.max())
     return [round(float(point / peak), 3) if peak else 0.0 for point in points]
 
 
-def detailed_waveform(rms: np.ndarray, duration: float, bpm: float, detected_beats: int) -> str:
-    """Encode a full-resolution signal with at least 16 samples per beat.
+def detailed_waveform(signal: np.ndarray, duration: float, bpm: float, detected_beats: int) -> str:
+    """Encode a full-resolution signal with 64 samples per beat.
 
     A byte per sample keeps the preparation document small enough for large
     crates, unlike storing thousands of BSON doubles for every track.
     """
     estimated_beats = duration * max(bpm, 60.0) / 60.0
-    point_count = max(512, math.ceil(max(float(detected_beats), estimated_beats) * 16))
-    values = np.asarray(waveform_points(rms, point_count), dtype=np.float32)
+    point_count = max(1_024, math.ceil(max(float(detected_beats), estimated_beats) * WAVEFORM_SAMPLES_PER_BEAT))
+    values = np.asarray(waveform_points(signal, point_count), dtype=np.float32)
     encoded = np.rint(np.clip(values, 0, 1) * 255).astype(np.uint8).tobytes()
     return base64.b64encode(encoded).decode("ascii")
 
@@ -707,16 +820,29 @@ def build_phrase_states(
     mid_frames = mel[(mel_frequencies >= 220) & (mel_frequencies <= 4_500)].sum(axis=0) / total
     onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
     flatness = librosa.feature.spectral_flatness(y=y, hop_length=hop_length)[0]
+    onset_scale = float(np.percentile(onset, 90)) if onset.size else 0.0
+    onset_normalised = np.clip(onset / max(onset_scale, 1e-6), 0, 1)
+    shared_frames = min(mid_frames.size, onset_normalised.size, flatness.size)
+    # This remains a lightweight proxy rather than a separated vocal stem, but
+    # unlike the old mean-onset multiplier it retains phrase-level evidence.
+    # Sustained, harmonic mid-band content scores higher than percussive frames.
+    vocal_frames = (
+        mid_frames[:shared_frames]
+        * (0.35 + 0.65 * (1 - onset_normalised[:shared_frames]))
+        * (0.40 + 0.60 * (1 - np.clip(flatness[:shared_frames], 0, 1)))
+    )
+    vocal_threshold = max(0.08, float(np.percentile(vocal_frames, 62))) if vocal_frames.size else 1.0
 
     raw: list[dict[str, float]] = []
     for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
         energy_frames = feature_window(rms, start, end, hop_length, sr)
         onset_frames = feature_window(onset, start, end, hop_length, sr)
         bass_window = feature_window(bass_frames, start, end, hop_length, sr)
-        mid_window = feature_window(mid_frames, start, end, hop_length, sr)
+        vocal_window = feature_window(vocal_frames, start, end, hop_length, sr)
         flat_window = feature_window(flatness, start, end, hop_length, sr)
         centroid_window = feature_window(spectral, start, end, hop_length, sr)
         split = max(1, energy_frames.size // 3)
+        vocal_edge = max(1, vocal_window.size // 4)
         energy_slope = float(np.mean(energy_frames[-split:]) - np.mean(energy_frames[:split])) if energy_frames.size else 0.0
         raw.append({
             "start": start,
@@ -726,15 +852,21 @@ def build_phrase_states(
             "energySlope": energy_slope,
             "bassActivity": float(np.mean(bass_window)) if bass_window.size else 0.0,
             "drumActivity": float(np.mean(onset_frames)) if onset_frames.size else 0.0,
-            # This is deliberately named activity rather than a vocal stem:
-            # a mid-band, low-transient signal is a conservative vocal-clash
-            # guard in the fast local analysis profile.
-            "vocalActivity": float(np.mean(mid_window) * (1 - min(1.0, float(np.mean(onset_frames)) * 6))) if mid_window.size else 0.0,
+            # These are deliberately named activity rather than vocal stems.
+            # Head/tail/continuity let the planner avoid cutting a sustained
+            # lyric even when the phrase-average score alone looks harmless.
+            "vocalActivity": float(np.mean(vocal_window)) if vocal_window.size else 0.0,
+            "vocalHeadActivity": float(np.mean(vocal_window[:vocal_edge])) if vocal_window.size else 0.0,
+            "vocalTailActivity": float(np.mean(vocal_window[-vocal_edge:])) if vocal_window.size else 0.0,
+            "vocalContinuity": float(np.mean(vocal_window >= vocal_threshold)) if vocal_window.size else 0.0,
             "spectralDensity": float(np.mean(centroid_window)) if centroid_window.size else 0.0,
             "harmonicDensity": float(1 - np.mean(flat_window)) if flat_window.size else 0.0,
             "steady": float(np.std(energy_frames) / max(np.mean(energy_frames), 1e-6)) if energy_frames.size else 1.0,
         })
-    for key in ("energy", "bassActivity", "drumActivity", "vocalActivity", "spectralDensity", "harmonicDensity"):
+    for key in (
+        "energy", "bassActivity", "drumActivity", "vocalActivity", "vocalHeadActivity",
+        "vocalTailActivity", "spectralDensity", "harmonicDensity",
+    ):
         values = normalise_phrase_feature([state[key] for state in raw])
         for state, value in zip(raw, values):
             state[key] = float(value)
@@ -755,6 +887,9 @@ def build_phrase_states(
             "energy": round(state["energy"], 3), "energySlope": round(float(np.clip(state["energySlope"] / max(slope_scale, 1e-6), -1, 1)), 3),
             "bassActivity": round(state["bassActivity"], 3), "drumActivity": round(state["drumActivity"], 3),
             "vocalActivity": round(state["vocalActivity"], 3), "spectralDensity": round(state["spectralDensity"], 3),
+            "vocalHeadActivity": round(state["vocalHeadActivity"], 3),
+            "vocalTailActivity": round(state["vocalTailActivity"], 3),
+            "vocalContinuity": round(float(np.clip(state["vocalContinuity"], 0, 1)), 3),
             "harmonicDensity": round(state["harmonicDensity"], 3), "noveltyIn": round(float(np.clip(novelty_in, 0, 1)), 3),
             "noveltyOut": round(float(np.clip(novelty_out, 0, 1)), 3), "loopability": round(float(loopability), 3),
             "cueConfidence": round(float(cue_confidence), 3),
@@ -810,9 +945,26 @@ def ensure_track_loudness(track: dict[str, Any]) -> None:
     track["loudnessLufs"] = integrated_loudness(source, np.empty(0, dtype=np.float32))
 
 
-def analyse_track(path: Path, preparation_id: str) -> dict[str, Any]:
+def analyse_track(path: Path, preparation_id: str) -> tuple[dict[str, Any], str]:
     track_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{preparation_id}:{path.relative_to(MUSIC_ROOT)}"))
     metadata, tag_genres, artwork_url = tags_for(path, track_id)
+    cached = read_analysis_cache(path)
+    if cached is not None:
+        cached_track, vector = cached
+        track = dict(cached_track)
+        track.update({"id": track_id, "artworkUrl": artwork_url})
+        track["embeddingIndexed"] = index_vector(track_id, vector, {
+            "preparationId": preparation_id, "title": track["title"], "artist": track["artist"],
+            "genres": track["genres"], "bpm": track["bpm"], "key": track["key"],
+            "energy": track["energy"], "loudnessLufs": track.get("loudnessLufs"),
+        })
+        return track, "cache"
+
+    # A timed-out legacy preparation may already have completed its expensive
+    # Harmonix pass and indexed the embedding before per-track cache existed.
+    # Retain those stored model outputs and rebuild only the cheap DSP details.
+    indexed_track = get_indexed_track(track_id)
+    indexed_vector, indexed_payload = indexed_track if indexed_track is not None else (None, {})
     y, sr = librosa.load(path, sr=ANALYSIS_SAMPLE_RATE, mono=True)
     duration = float(librosa.get_duration(y=y, sr=sr))
     hop = 512
@@ -821,13 +973,18 @@ def analyse_track(path: Path, preparation_id: str) -> dict[str, Any]:
     if bpm < 55 and bpm > 0:
         bpm *= 2
     rms = librosa.feature.rms(y=y, hop_length=hop)[0]
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    # We only need stable pitch-class energy for key compatibility. Explicitly
+    # pinning concert tuning avoids librosa trying to infer it from silent
+    # frames, which otherwise emits one warning per empty analysis window.
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop, tuning=0.0)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=24, hop_length=hop)
     spectral = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)[0]
     beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop)
-    deep = harmonix(path, y, sr)
+    deep = None if indexed_vector is not None else harmonix(path, y, sr)
     if deep and deep["bpm"] > 0:
         bpm = deep["bpm"]
+    elif indexed_payload.get("bpm"):
+        bpm = float(indexed_payload["bpm"])
     if deep and deep.get("beats"):
         beat_times = np.asarray(deep["beats"], dtype=float)
     downbeats = np.asarray(deep.get("downbeats", []) if deep else [], dtype=float)
@@ -844,22 +1001,33 @@ def analyse_track(path: Path, preparation_id: str) -> dict[str, Any]:
     # a safe fallback, while the transition controller can prefer the big 1.
     entries = sorted({*entries, *(round(point, 2) for point in phrase_starts if 3 < point < duration - 15)})
     exits = sorted({*exits, *(round(point, 2) for point in phrase_ends if 15 < point < duration - 3)})
-    energy = float(np.clip(np.percentile(rms, 75) * 4.0, 0, 1)) if rms.size else 0.0
-    loudness_lufs = integrated_loudness(path, y)
-    genres = tag_genres or heuristic_genres(bpm, float(spectral.mean()) if spectral.size else 0, energy)
-    vector = project_embedding(deep.get("embedding") if deep else None, mfcc, chroma, spectral)
+    measured_energy = float(np.clip(np.percentile(rms, 75) * 4.0, 0, 1)) if rms.size else 0.0
+    energy = float(indexed_payload.get("energy", measured_energy))
+    loudness_lufs = float(indexed_payload["loudnessLufs"]) if indexed_payload.get("loudnessLufs") is not None else integrated_loudness(path, y)
+    stored_genres = indexed_payload.get("genres")
+    genres = list(stored_genres) if isinstance(stored_genres, list) and stored_genres else tag_genres or heuristic_genres(
+        bpm, float(spectral.mean()) if spectral.size else 0, energy,
+    )
+    key = str(indexed_payload.get("key") or estimate_key(chroma))
+    vector = indexed_vector if indexed_vector is not None else project_embedding(
+        deep.get("embedding") if deep else None, mfcc, chroma, spectral,
+    )
     indexed = index_vector(track_id, vector, {
         "preparationId": preparation_id, "title": metadata["title"], "artist": metadata["artist"],
-        "genres": genres, "bpm": bpm, "key": estimate_key(chroma), "energy": energy, "loudnessLufs": loudness_lufs,
+        "genres": genres, "bpm": bpm, "key": key, "energy": energy, "loudnessLufs": loudness_lufs,
     })
     first_drop = next((segment["start"] for segment in segments if segment["label"] in {"chorus", "drop"}), None)
-    return {
+    track = {
         "id": track_id,
         "relativePath": path.relative_to(MUSIC_ROOT).as_posix(),
         "title": metadata["title"], "artist": metadata["artist"], "album": metadata["album"],
         "artworkUrl": artwork_url, "durationSeconds": round(duration, 2), "bpm": round(bpm, 2),
-        "key": estimate_key(chroma), "energy": round(energy, 3), "loudnessLufs": loudness_lufs,
-        "waveform": waveform_points(rms), "waveformDetail": detailed_waveform(rms, duration, bpm, len(beat_times)),
+        "key": key, "energy": round(energy, 3), "loudnessLufs": loudness_lufs,
+        # Render both waveform resolutions from decoded PCM, not analysis-rate
+        # RMS frames. This makes every waveform x-coordinate share the same
+        # zero and duration as the stored beat and downbeat grids.
+        "waveform": waveform_points(y), "waveformDetail": detailed_waveform(y, duration, bpm, len(beat_times)),
+        "waveformDetailVersion": WAVEFORM_DETAIL_VERSION,
         "beatGrid": [round(float(point), 3) for point in beat_times], "downbeats": [round(float(point), 3) for point in downbeats],
         "genres": genres, "segments": segments, "phraseStates": phrase_states,
         "cues": {
@@ -868,6 +1036,8 @@ def analyse_track(path: Path, preparation_id: str) -> dict[str, Any]:
         },
         "embeddingIndexed": indexed,
     }
+    write_analysis_cache(path, track, vector)
+    return track, "indexed" if indexed_vector is not None else "analysed"
 
 
 @app.get("/health")
@@ -896,11 +1066,13 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
     if not paths:
         raise HTTPException(422, "No supported music files were found in the selected folder")
     tracks, failures = [], []
+    reused_count = 0
     total = len(paths)
     report_preparation_progress(
         preparation_id, progress=8, discovered_track_count=total,
         analysed_track_count=0, failed_track_count=0, current_track=None,
         message=f"Found {total} track{'s' if total != 1 else ''}. Starting local analysis.",
+        cached_track_count=0,
     )
     for path in paths:
         processed = len(tracks) + len(failures)
@@ -908,11 +1080,15 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
             preparation_id, progress=8 + round(processed / total * 87),
             discovered_track_count=total, analysed_track_count=len(tracks),
             failed_track_count=len(failures), current_track=path.name,
-            message=f"Analysing track {processed + 1} of {total}",
+            message=f"Preparing track {processed + 1} of {total}; {reused_count} reused from cache",
+            cached_track_count=reused_count,
         )
         try:
             ensure_job_active("preparation", preparation_id)
-            tracks.append(analyse_track(path, preparation_id))
+            track, source_kind = analyse_track(path, preparation_id)
+            tracks.append(track)
+            if source_kind != "analysed":
+                reused_count += 1
         except HTTPException:
             raise
         except Exception as problem:
@@ -922,19 +1098,25 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
             preparation_id, progress=8 + round(processed / total * 87),
             discovered_track_count=total, analysed_track_count=len(tracks),
             failed_track_count=len(failures), current_track=path.name,
-            message=(f"Analysed {processed} of {total}" if len(failures) == 0 else f"Analysed {len(tracks)} of {total}; {len(failures)} skipped"),
+            message=(
+                f"Prepared {processed} of {total}; {reused_count} reused"
+                if len(failures) == 0
+                else f"Prepared {len(tracks)} of {total}; {reused_count} reused; {len(failures)} skipped"
+            ),
+            cached_track_count=reused_count,
         )
     ensure_job_active("preparation", preparation_id)
     if not tracks:
         raise HTTPException(422, "No audio files could be decoded. Ensure FFmpeg supports the library format.")
-    genres = sorted({genre for track in tracks for genre in track["genres"]})
+    genres = sorted({genre for track in tracks for genre in track.get("genres", [])})
     report_preparation_progress(
         preparation_id, progress=97, discovered_track_count=total,
         analysed_track_count=len(tracks), failed_track_count=len(failures), current_track=None,
         message="Finalising music features and mix data",
+        cached_track_count=reused_count,
     )
     return {
-        "tracks": tracks, "genres": genres,
+        "tracks": tracks, "genres": genres, "cachedTrackCount": reused_count,
         "modelReport": {
             "structureModel": (
                 "Harmonix fast spectral proxy via all-in-one-infer (with librosa fallback)"
@@ -1186,35 +1368,161 @@ def transition_policy_controls(features: np.ndarray) -> dict[str, float] | None:
         return None
 
 
+def vocal_boundary_risk(
+    outgoing_state: dict[str, Any] | None,
+    incoming_state: dict[str, Any] | None,
+) -> tuple[float, float, float]:
+    """Return outgoing lyric-cut, incoming vocal-head and overlap risks."""
+    outgoing = outgoing_state or {}
+    incoming = incoming_state or {}
+    outgoing_activity = float(outgoing.get("vocalActivity", 0.25))
+    incoming_activity = float(incoming.get("vocalActivity", 0.25))
+    outgoing_tail = float(outgoing.get("vocalTailActivity", outgoing_activity))
+    incoming_head = float(incoming.get("vocalHeadActivity", incoming_activity))
+    continuity = float(outgoing.get("vocalContinuity", outgoing_activity))
+    lyric_cut = float(np.clip(outgoing_tail * (0.45 + 0.55 * continuity), 0, 1))
+    overlap = float(np.clip(max(outgoing_activity * incoming_activity, outgoing_tail * incoming_head), 0, 1))
+    return lyric_cut, float(np.clip(incoming_head, 0, 1)), overlap
+
+
+def transition_compatibility_score(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    outgoing_state: dict[str, Any] | None,
+    incoming_state: dict[str, Any] | None,
+    harmonic_compatibility: float | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Score a cue pair using feature weights learned from professional sets.
+
+    The target for a feature is not assumed to be zero. If professionals tend
+    to introduce a controlled energy or spectrum contrast, the exported
+    profile can reward that instead of blindly maximizing vector similarity.
+    Beat, bar and phrase constraints remain hard gates outside this score.
+    """
+    outgoing = outgoing_state or {}
+    incoming = incoming_state or {}
+    harmonic = harmonic_compatibility
+    if harmonic is None:
+        harmonic = key_score(str(first.get("key", "")), str(second.get("key", "")))
+    observed = {
+        "energy": abs(float(outgoing.get("energy", first.get("energy", 0.5))) - float(incoming.get("energy", second.get("energy", 0.5)))),
+        "trajectory": abs(float(outgoing.get("energySlope", 0.0)) - float(incoming.get("energySlope", 0.0))),
+        "bass": abs(float(outgoing.get("bassActivity", 0.5)) - float(incoming.get("bassActivity", 0.5))),
+        "drums": abs(float(outgoing.get("drumActivity", 0.5)) - float(incoming.get("drumActivity", 0.5))),
+        "vocals": abs(float(outgoing.get("vocalActivity", 0.25)) - float(incoming.get("vocalActivity", 0.25))),
+        "spectral": abs(float(outgoing.get("spectralDensity", 0.5)) - float(incoming.get("spectralDensity", 0.5))),
+        "harmonic": 1.0 - float(np.clip(harmonic, 0, 1)),
+        "novelty": abs(float(outgoing.get("noveltyOut", 0.0)) - float(incoming.get("noveltyIn", 0.0))),
+    }
+    policy = load_transition_policy() or {}
+    exported = policy.get("compatibilityProfile", {}).get("features", {})
+    profile = exported if isinstance(exported, dict) and exported else DEFAULT_COMPATIBILITY_PROFILE
+    weighted = 0.0
+    total_weight = 0.0
+    component_scores: dict[str, float] = {}
+    for name, value in observed.items():
+        settings = profile.get(name, DEFAULT_COMPATIBILITY_PROFILE[name])
+        try:
+            weight = max(0.0, float(settings.get("weight", 0.0)))
+            target = float(settings.get("targetDelta", 0.0))
+            scale = max(0.035, float(settings.get("scale", 0.25)))
+        except (AttributeError, TypeError, ValueError):
+            settings = DEFAULT_COMPATIBILITY_PROFILE[name]
+            weight = float(settings["weight"])
+            target = float(settings["targetDelta"])
+            scale = float(settings["scale"])
+        fit = math.exp(-0.5 * ((value - target) / scale) ** 2)
+        component_scores[name] = round(float(np.clip(fit, 0, 1)), 4)
+        weighted += weight * fit
+        total_weight += weight
+    return float(np.clip(weighted / max(total_weight, 1e-8), 0, 1)), component_scores
+
+
 def near_grid(point: float, grid: list[float] | np.ndarray, tolerance: float) -> bool:
     values = np.asarray(grid, dtype=float)
     return bool(values.size and float(np.min(np.abs(values - point))) <= tolerance)
+
+
+def _anchored_beat_span(track: dict[str, Any], start: float, end: float) -> np.ndarray | None:
+    """Return a beat sequence whose first and last beats lock to a cue span.
+
+    Phrase labels are deliberately allowed a little semantic flexibility, but
+    a two-deck overlay is not: its musical endpoints must actually land on
+    detected beats.  Returning ``None`` here turns an uncertain candidate into
+    a filtered hand-off instead of an optimistic, drifting blend.
+    """
+    grid = np.asarray(sorted({float(point) for point in track.get("beatGrid", [])}), dtype=float)
+    if grid.size < 5:
+        return None
+    first_index = int(np.argmin(np.abs(grid - start)))
+    last_index = int(np.argmin(np.abs(grid - end)))
+    if (
+        first_index >= last_index
+        or abs(float(grid[first_index]) - start) > BEAT_ANCHOR_TOLERANCE_SECONDS
+        or abs(float(grid[last_index]) - end) > BEAT_ANCHOR_TOLERANCE_SECONDS
+    ):
+        return None
+    beats = grid[first_index:last_index + 1]
+    return beats if beats.size >= 5 else None
+
+
+def beat_overlay_fit(
+    first: dict[str, Any], second: dict[str, Any], outgoing_start: float, outgoing_end: float,
+    incoming_start: float, incoming_end: float, outgoing_factor: float,
+) -> dict[str, float] | None:
+    """Fit the incoming atempo factor against every beat in an overlay.
+
+    The former check compared two sequences after subtracting their respective
+    first beat.  That measured drift but accidentally discarded a phase error
+    at the real crossfade boundary.  This fit keeps that phase term, derives
+    the factor from all paired beats, and rejects a missing/unequal grid rather
+    than silently pairing arbitrary beat indices.
+    """
+    outgoing_beats = _anchored_beat_span(first, outgoing_start, outgoing_end)
+    incoming_beats = _anchored_beat_span(second, incoming_start, incoming_end)
+    if outgoing_beats is None or incoming_beats is None or outgoing_beats.size != incoming_beats.size:
+        return None
+    outgoing_rendered = (outgoing_beats - outgoing_start) / max(outgoing_factor, 1e-6)
+    incoming_source = incoming_beats - incoming_start
+    # Least-squares fit through the actual overlap origin.  The first beat is
+    # intentionally retained so a cue that begins between beats is penalised.
+    denominator = float(np.dot(incoming_source, outgoing_rendered))
+    if denominator <= 1e-8:
+        return None
+    incoming_factor = float(np.dot(incoming_source, incoming_source) / denominator)
+    if not math.isfinite(incoming_factor) or incoming_factor <= 0:
+        return None
+    incoming_rendered = incoming_source / incoming_factor
+    residual = np.abs(outgoing_rendered - incoming_rendered)
+    return {
+        "tempoFactor": incoming_factor,
+        "residualMs": float(np.percentile(residual, 95) * 1000),
+        "phaseErrorMs": float(residual[0] * 1000),
+        "beatCount": float(outgoing_beats.size),
+    }
 
 
 def transition_grid_error_ms(
     first: dict[str, Any], second: dict[str, Any], outgoing_start: float, outgoing_end: float,
     incoming_start: float, incoming_end: float, outgoing_factor: float, incoming_factor: float,
 ) -> float:
-    """Measure paired beat residuals in rendered time, not source time."""
-    outgoing = np.asarray([
-        (float(point) - outgoing_start) / max(outgoing_factor, 1e-6)
-        for point in first.get("beatGrid", []) if outgoing_start - 0.05 <= float(point) <= outgoing_end + 0.05
-    ])
-    incoming = np.asarray([
-        (float(point) - incoming_start) / max(incoming_factor, 1e-6)
-        for point in second.get("beatGrid", []) if incoming_start - 0.05 <= float(point) <= incoming_end + 0.05
-    ])
-    count = min(outgoing.size, incoming.size)
-    if count < 4:
+    """Measure boundary-inclusive beat residual using a supplied tempo factor."""
+    outgoing_beats = _anchored_beat_span(first, outgoing_start, outgoing_end)
+    incoming_beats = _anchored_beat_span(second, incoming_start, incoming_end)
+    if outgoing_beats is None or incoming_beats is None or outgoing_beats.size != incoming_beats.size:
         return 999.0
-    # The first detector point can sit just outside a floating-point boundary;
-    # align both sequences to their own first beat before judging drift.
-    outgoing = outgoing[:count] - outgoing[0]
-    incoming = incoming[:count] - incoming[0]
+    outgoing = (outgoing_beats - outgoing_start) / max(outgoing_factor, 1e-6)
+    incoming = (incoming_beats - incoming_start) / max(incoming_factor, 1e-6)
     return round(float(np.percentile(np.abs(outgoing - incoming), 95) * 1000), 2)
 
 
-def safe_exit_for(track: dict[str, Any], source_start: float, minimum: float, maximum: float) -> float | None:
+def safe_exit_for(
+    track: dict[str, Any],
+    source_start: float,
+    minimum: float,
+    maximum: float,
+    duration_preference: float | None = None,
+) -> float | None:
     """Choose a downbeat at a phrase end, protecting the middle of high-energy sections."""
     natural_end = float(track["durationSeconds"]) - 0.25
     remaining = natural_end - source_start
@@ -1240,7 +1548,8 @@ def safe_exit_for(track: dict[str, Any], source_start: float, minimum: float, ma
     # points. They remain a fallback only for short or irregular material.
     candidates = sorted({round(point, 3) for point in (phrase_exits or safe_exits or downbeats)})
     has_explicit_phrase_clock = bool(phrase_states_for(track) or track.get("cues", {}).get("phraseBoundaries"))
-    target = (lower + upper) / 2
+    preference = float(np.clip(duration_preference if duration_preference is not None else 0.5, 0.10, 0.90))
+    target = lower + (upper - lower) * preference
     beat = beat_duration(track)
 
     def penalty(point: float) -> float:
@@ -1273,6 +1582,12 @@ def safe_exit_for(track: dict[str, Any], source_start: float, minimum: float, ma
         if state:
             value -= float(state.get("cueConfidence", 0.5)) * 6
             value -= float(state.get("loopability", 0.5)) * 2
+            lyric_cut, _, _ = vocal_boundary_risk(state, None)
+            # A phrase boundary is not automatically the end of a sentence.
+            # Strong sustained vocal evidence makes another phrase exit much
+            # preferable, while still allowing the natural end of a file.
+            if lyric_cut >= 0.34 and point < natural_end - beat * 1.1:
+                value += 34.0 * lyric_cut
         return value
 
     viable = [point for point in candidates if penalty(point) < 10_000]
@@ -1342,6 +1657,7 @@ def safe_entry_for(first: dict[str, Any], second: dict[str, Any], outgoing_exit:
             # bass-heavy starts remain valid, but are reserved for guarded EQ.
             value += float(state.get("bassActivity", 0.5)) * 5
             value += float(state.get("vocalActivity", 0.5)) * 8
+            value += float(state.get("vocalHeadActivity", state.get("vocalActivity", 0.5))) * 10
             value -= float(state.get("cueConfidence", 0.5)) * 5
         return value + point / 3200  # prefer an earlier equivalent phase only
 
@@ -1357,6 +1673,7 @@ def learned_cue_pair(
     source_bpm: float,
     fallback_exit: float,
     fallback_entry: float,
+    duration_preference: float = 0.5,
 ) -> tuple[float, float, dict[str, float] | None]:
     """Let the compact policy rank safe phrase candidates, never raw samples."""
     if load_transition_policy() is None:
@@ -1364,7 +1681,7 @@ def learned_cue_pair(
     natural_end = float(first["durationSeconds"]) - 0.25
     lower = source_start + min(minimum, max(0.5, natural_end - source_start))
     upper = min(natural_end, source_start + maximum)
-    target = (lower + upper) / 2
+    target = lower + (upper - lower) * float(np.clip(duration_preference, 0.10, 0.90))
     beat = beat_duration(first, source_bpm)
     exit_points = {
         fallback_exit,
@@ -1379,7 +1696,7 @@ def learned_cue_pair(
         if (is_build_section(before) or is_protected_section(before)) and point < float(before["end"]) - beat * 1.1:
             continue
         safe_exits.append(point)
-    safe_exits = sorted(safe_exits, key=lambda point: abs(point - target))[:6] or [fallback_exit]
+    safe_exits = sorted(safe_exits, key=lambda point: abs(point - target))[:10] or [fallback_exit]
 
     best: tuple[float, float, dict[str, float], float] | None = None
     latest_entry = float(second["durationSeconds"]) - min(minimum, float(second["durationSeconds"]) - 0.5) - 0.25
@@ -1393,7 +1710,7 @@ def learned_cue_pair(
             entry_points.add(default_entry)
         outgoing_state = phrase_state_at_boundary(first, exit_point, "exit")
         outgoing_energy = float((outgoing_state or {}).get("energy", section_energy(first, exit_point - beat / 2)))
-        candidates: list[tuple[float, float]] = []
+        candidates: list[tuple[float, float, float]] = []
         for entry_point in entry_points:
             if not 0 <= entry_point <= latest_entry:
                 continue
@@ -1403,9 +1720,14 @@ def learned_cue_pair(
                 continue
             if is_protected_section(incoming_section) and outgoing_energy < 0.70:
                 continue
-            candidates.append((entry_point, incoming_energy))
-        candidates.sort(key=lambda item: abs(item[1] - outgoing_energy))
-        for entry_point, incoming_energy in candidates[:8]:
+            incoming_state = phrase_state_at_boundary(second, entry_point, "entry")
+            compatibility, _ = transition_compatibility_score(first, second, outgoing_state, incoming_state)
+            _, incoming_head, vocal_overlap = vocal_boundary_risk(outgoing_state, incoming_state)
+            cue = float((incoming_state or {}).get("cueConfidence", 0.5))
+            pre_score = 0.65 * compatibility + 0.20 * cue + 0.15 * (1 - max(incoming_head, vocal_overlap))
+            candidates.append((entry_point, incoming_energy, pre_score))
+        candidates.sort(key=lambda item: item[2], reverse=True)
+        for entry_point, incoming_energy, _ in candidates[:12]:
             incoming_state = phrase_state_at_boundary(second, entry_point, "entry")
             controls = transition_policy_controls(policy_state_vector(
                 first, second, outgoing_state, incoming_state, source_bpm,
@@ -1423,25 +1745,28 @@ def learned_cue_pair(
             outgoing_factor = source_bpm / max(float(first.get("bpm") or source_bpm), 1.0)
             outgoing_duration = (exit_point - outgoing_start) / max(outgoing_factor, 1e-6)
             incoming_duration = incoming_end - entry_point
-            requested_factor = incoming_duration / max(outgoing_duration, 1e-6)
+            nominal_factor = incoming_duration / max(outgoing_duration, 1e-6)
+            beat_fit = beat_overlay_fit(
+                first, second, outgoing_start, exit_point, entry_point, incoming_end, outgoing_factor,
+            )
+            requested_factor = float(beat_fit["tempoFactor"]) if beat_fit else nominal_factor
             global_factor = source_bpm / max(float(second.get("bpm") or source_bpm), 1.0)
             tolerance = max(0.10, beat * 0.32)
             if not (
+                beat_fit is not None
+                and
                 0.92 <= requested_factor <= 1.08
                 and abs(requested_factor / max(global_factor, 1e-6) - 1) <= 0.035
                 and near_grid(exit_point, derived_phrase_boundaries(first), tolerance)
                 and near_grid(entry_point, derived_phrase_boundaries(second), tolerance)
                 and near_grid(outgoing_start, first.get("downbeats", []), tolerance)
                 and near_grid(entry_point, second.get("downbeats", []), tolerance)
-                and transition_grid_error_ms(
-                    first, second, outgoing_start, exit_point, entry_point, incoming_end,
-                    outgoing_factor, requested_factor,
-                ) <= 45.0
+                and float(beat_fit["residualMs"]) <= MAX_BEAT_OVERLAY_RESIDUAL_MS
             ):
                 continue
-            energy_fit = 1.0 - min(1.0, abs(outgoing_energy - incoming_energy))
+            compatibility, _ = transition_compatibility_score(first, second, outgoing_state, incoming_state)
             bass_collision = float((outgoing_state or {}).get("bassActivity", 0.5)) * float((incoming_state or {}).get("bassActivity", 0.5))
-            vocal_collision = float((outgoing_state or {}).get("vocalActivity", 0.25)) * float((incoming_state or {}).get("vocalActivity", 0.25))
+            lyric_cut, incoming_head, vocal_collision = vocal_boundary_risk(outgoing_state, incoming_state)
             cue_confidence = 0.5 * (
                 float((outgoing_state or {}).get("cueConfidence", 0.5))
                 + float((incoming_state or {}).get("cueConfidence", 0.5))
@@ -1454,11 +1779,13 @@ def learned_cue_pair(
                 # Do not bury the audible build-down/tail of a peak behind a
                 # new high-energy phrase; select another entry or exit.
                 trajectory_penalty = 0.35
+            duration_fit = 1.0 - min(1.0, abs(exit_point - target) / max(upper - lower, 1.0))
+            vocal_boundary_penalty = 0.52 * lyric_cut + 0.16 * max(0.0, incoming_head - 0.55)
             score = (
-                0.52 * float(controls.get("timing_score", 0.5))
-                + 0.24 * energy_fit + 0.12 * cue_confidence
+                0.42 * float(controls.get("timing_score", 0.5))
+                + 0.26 * compatibility + 0.12 * cue_confidence + 0.08 * duration_fit
                 + 0.06 * (1 - bass_collision) + 0.06 * (1 - vocal_collision)
-                - trajectory_penalty
+                - trajectory_penalty - vocal_boundary_penalty
             )
             if best is None or score > best[3]:
                 best = (exit_point, entry_point, controls, score)
@@ -1480,8 +1807,9 @@ def transition_between(
     minimum: float = 2.0,
     maximum: float = 14.0,
     running_bpm: float | None = None,
+    duration_preference: float = 0.5,
 ) -> dict[str, Any] | None:
-    exit_at = safe_exit_for(first, source_start, minimum, maximum)
+    exit_at = safe_exit_for(first, source_start, minimum, maximum, duration_preference)
     if exit_at is None:
         return None
     entry_at = safe_entry_for(first, second, exit_at, minimum)
@@ -1490,6 +1818,7 @@ def transition_between(
     source_bpm = float(running_bpm or first["bpm"] or 120.0)
     exit_at, entry_at, learned_controls = learned_cue_pair(
         first, second, source_start, minimum, maximum, source_bpm, exit_at, entry_at,
+        duration_preference,
     )
     outgoing_factor = source_bpm / max(float(first.get("bpm") or source_bpm), 1.0)
     tempo_ratio = second["bpm"] / source_bpm if source_bpm else 1.0
@@ -1518,12 +1847,17 @@ def transition_between(
     # rounding errors: both phrase endpoints land together after atempo, not
     # just the first kick of the overlap.
     requested_factor = global_factor
+    beat_fit: dict[str, float] | None = None
     overlap = min(1.25, max(0.55, 60.0 / source_bpm * 2))
     if phrase_matched and outgoing_phrase_start is not None and incoming_phrase_end is not None:
         outgoing_phrase_duration = (exit_at - outgoing_phrase_start) / max(outgoing_factor, 1e-6)
         incoming_phrase_duration = incoming_phrase_end - entry_at
         if outgoing_phrase_duration > 2 and incoming_phrase_duration > 2:
-            requested_factor = incoming_phrase_duration / outgoing_phrase_duration
+            nominal_factor = incoming_phrase_duration / outgoing_phrase_duration
+            beat_fit = beat_overlay_fit(
+                first, second, outgoing_phrase_start, exit_at, entry_at, incoming_phrase_end, outgoing_factor,
+            )
+            requested_factor = float(beat_fit["tempoFactor"]) if beat_fit else nominal_factor
             overlap = outgoing_phrase_duration
 
     # Exact beat overlays are only enabled when tempo, bar phase, phrase phase,
@@ -1543,13 +1877,12 @@ def transition_between(
             or near_grid(entry_at, second.get("beatGrid", []), tolerance)
         )
     )
-    beat_alignment_error_ms = 999.0
-    if factor_is_safe and bar_matched and outgoing_phrase_start is not None and incoming_phrase_end is not None:
-        beat_alignment_error_ms = transition_grid_error_ms(
-            first, second, outgoing_phrase_start, exit_at, entry_at, incoming_phrase_end,
-            outgoing_factor, tempo_factor,
-        )
-    beat_matched = factor_is_safe and bar_matched and beat_alignment_error_ms <= 45.0
+    beat_alignment_error_ms = float(beat_fit["residualMs"]) if beat_fit else 999.0
+    beat_phase_error_ms = float(beat_fit["phaseErrorMs"]) if beat_fit else 999.0
+    beat_matched = (
+        factor_is_safe and bar_matched and beat_fit is not None
+        and beat_alignment_error_ms <= MAX_BEAT_OVERLAY_RESIDUAL_MS
+    )
     if not beat_matched:
         tempo_factor = 1.0
         overlap = min(1.25, max(0.55, 60.0 / source_bpm * 2))
@@ -1560,37 +1893,40 @@ def transition_between(
     incoming_energy = float(incoming_state.get("energy")) if incoming_state else section_energy(second, entry_at + beat_duration(second) / 2)
     outgoing_section = segment_at(first, max(source_start, exit_at - beat_duration(first, source_bpm)))
     incoming_section = segment_at(second, entry_at + beat_duration(second) / 2)
-    energy_delta = abs(outgoing_energy - incoming_energy)
-    energy_score = max(0.0, 1 - energy_delta / 0.8)
     outgoing_bass = float((outgoing_state or {}).get("bassActivity", 0.5))
     incoming_bass = float((incoming_state or {}).get("bassActivity", 0.5))
     outgoing_vocals = float((outgoing_state or {}).get("vocalActivity", 0.25))
-    incoming_vocals = float((incoming_state or {}).get("vocalActivity", 0.25))
     bass_clash_risk = outgoing_bass * incoming_bass
-    vocal_clash_risk = outgoing_vocals * incoming_vocals
-    trajectory_score = max(
-        0.0,
-        1 - abs(float((outgoing_state or {}).get("energySlope", 0.0)) - float((incoming_state or {}).get("energySlope", 0.0))) / 2,
+    lyric_cut_risk, incoming_vocal_head, vocal_clash_risk = vocal_boundary_risk(outgoing_state, incoming_state)
+    learned_compatibility, compatibility_components = transition_compatibility_score(
+        first, second, outgoing_state, incoming_state, harmonic,
     )
     phrase_compatibility = float(np.clip(
-        0.42 * energy_score + 0.22 * trajectory_score + 0.18 * (1 - bass_clash_risk) + 0.18 * (1 - vocal_clash_risk),
+        0.72 * learned_compatibility + 0.14 * (1 - bass_clash_risk) + 0.14 * (1 - vocal_clash_risk),
         0, 1,
     ))
     shared_genre = set(first["genres"]) & set(second["genres"])
     genre_score = 1.0 if shared_genre else 0.55
     similarity = vector_score(first["id"], second["id"])
     phase_score = 1.0 if beat_matched and phrase_matched else 0.35 if phrase_matched else 0.0
+    cue_score = 0.5 * (
+        float((outgoing_state or {}).get("cueConfidence", 0.5))
+        + float((incoming_state or {}).get("cueConfidence", 0.5))
+    )
     score = 100 * (
-        0.18 * harmonic + 0.16 * tempo_score + 0.22 * phrase_compatibility
-        + 0.10 * genre_score + 0.12 * similarity + 0.22 * phase_score
+        0.18 * tempo_score + 0.26 * phase_score + 0.28 * phrase_compatibility
+        + 0.10 * harmonic + 0.07 * genre_score + 0.05 * similarity + 0.06 * cue_score
     )
     guard_outgoing = section_label(outgoing_section) in SENSITIVE_HANDOFF_SECTIONS and incoming_energy >= 0.70
     if not beat_matched:
         technique = "phrase-boundary-cut"
         fade_shape = "fast-outgoing"
+    elif lyric_cut_risk >= 0.34:
+        technique = "vocal-carry-bed"
+        fade_shape = "vocal-carry"
     elif vocal_clash_risk >= 0.30:
         technique = "vocal-guarded-eq"
-        fade_shape = "fast-outgoing"
+        fade_shape = "long-release"
     elif guard_outgoing or incoming_energy > outgoing_energy + 0.18:
         technique = "build-and-bass-swap"
         fade_shape = "incoming-lift"
@@ -1600,8 +1936,10 @@ def transition_between(
     else:
         technique = "long-eq-blend"
         fade_shape = "equal-power"
-    if guard_outgoing:
+    if guard_outgoing and lyric_cut_risk < 0.34:
         fade_shape = "fast-outgoing"
+    elif lyric_cut_risk >= 0.34 and beat_matched:
+        fade_shape = "vocal-carry"
     elif outgoing_energy > incoming_energy + 0.22 and beat_matched:
         fade_shape = "long-release"
     overlap_bars = PHRASE_BARS * selected_phrases if beat_matched else 0
@@ -1622,6 +1960,8 @@ def transition_between(
         beat_matched and learned_controls
         and learned_controls.get("loop_probability", 0.0) >= 0.65
         and float((outgoing_state or {}).get("loopability", 0.0)) >= 0.65
+        and outgoing_vocals < 0.36
+        and float((outgoing_state or {}).get("vocalTailActivity", outgoing_vocals)) < 0.32
     ):
         loop_seconds = round(4 * 60.0 / source_bpm, 3)
     if beat_matched:
@@ -1631,18 +1971,22 @@ def transition_between(
     else:
         style = "protected emergency hand-off"
     notes = [
-        f"harmonic {harmonic:.0%}", f"phrase-state match {phrase_compatibility:.0%}",
-        f"embedding affinity {similarity:.0%}", "high-energy phrases protected", f"{technique} controller",
+        f"harmonic {harmonic:.0%}", f"learned phrase compatibility {phrase_compatibility:.0%}",
+        f"embedding affinity {similarity:.0%} (low-weight tie-breaker)",
+        "high-energy phrases protected", f"{technique} controller",
     ]
     if beat_matched:
         notes.extend([
             f"pitch-preserving tempo {(tempo_factor - 1):+.1%}",
-            f"{overlap_bars}-bar phrase overlay", f"95th percentile beat residual {beat_alignment_error_ms:.1f} ms",
+            f"{overlap_bars}-bar phrase overlay",
+            f"95th percentile beat residual {beat_alignment_error_ms:.1f} ms; boundary phase {beat_phase_error_ms:.1f} ms",
         ])
     else:
         notes.append("overlap disabled because beat/bar/phrase lock did not pass")
     if guard_outgoing:
         notes.append("outgoing build/breakdown is removed early before the incoming high-energy phrase")
+    if lyric_cut_risk >= 0.34:
+        notes.append("outgoing vocal is carried to the phrase tail while the incoming bed stays ducked")
     if learned_controls:
         notes.append(f"runtime policy {transition_policy_status()} (critic and trainer offline)")
     return {
@@ -1650,9 +1994,13 @@ def transition_between(
         "enterAtSeconds": round(entry_at, 2), "overlapSeconds": round(overlap, 3), "bpmRatio": round(tempo_ratio, 4),
         "tempoFactor": round(tempo_factor, 4), "loopSeconds": round(loop_seconds, 3), "beatMatched": beat_matched,
         "barMatched": bar_matched, "phraseMatched": phrase_matched,
-        "beatAlignmentErrorMs": beat_alignment_error_ms, "overlapBars": overlap_bars,
+        "beatAlignmentErrorMs": round(beat_alignment_error_ms, 2),
+        "beatPhaseErrorMs": round(beat_phase_error_ms, 2), "overlapBars": overlap_bars,
         "fadeShape": fade_shape, "technique": technique, "bassSwapProgress": bass_swap_progress,
         "vocalClashRisk": round(vocal_clash_risk, 3),
+        "vocalBoundaryRisk": round(lyric_cut_risk, 3), "incomingVocalHead": round(incoming_vocal_head, 3),
+        "learnedCompatibility": round(learned_compatibility, 4),
+        "compatibilityComponents": compatibility_components,
         "fadeOutCurve": round(fade_out_curve, 4), "fadeInCurve": round(fade_in_curve, 4),
         "outgoingLowDb": round(outgoing_low_db, 3), "incomingLowDb": round(incoming_low_db, 3),
         "outgoingMidDb": round(outgoing_mid_db, 3), "incomingMidDb": round(incoming_mid_db, 3),
@@ -1664,12 +2012,46 @@ def transition_between(
     }
 
 
-def ordered_tracks(tracks: list[dict[str, Any]], genre_order: list[str]) -> list[dict[str, Any]]:
-    order = {normalise_genre(genre): index for index, genre in enumerate(genre_order)}
+def ordered_tracks(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build one continuous, low-to-peak energy progression.
+
+    Genre describes a track but is not a sequencing constraint: a genre bucket
+    can contain either warm-up material or a peak-time record. Ordering the
+    whole crate by measured energy keeps adjacent records close in intensity;
+    BPM and title only make equal-energy ties reproducible.
+    """
+    def energy(track: dict[str, Any]) -> float:
+        try:
+            value = float(track.get("energy", 0.5))
+        except (TypeError, ValueError):
+            value = 0.5
+        return float(np.clip(value, 0.0, 1.0)) if math.isfinite(value) else 0.5
+
+    def bpm(track: dict[str, Any]) -> float:
+        try:
+            value = float(track.get("bpm", 120.0))
+        except (TypeError, ValueError):
+            value = 120.0
+        return value if math.isfinite(value) else 120.0
+
     return sorted(
         tracks,
-        key=lambda track: (min((order.get(normalise_genre(genre), len(order)) for genre in track["genres"]), default=len(order)), track["energy"], track["title"].lower()),
+        key=lambda track: (energy(track), bpm(track), str(track.get("title", "")).lower(), str(track.get("id", ""))),
     )
+
+
+def duration_preference_for(index: int, current: dict[str, Any], upcoming: dict[str, Any]) -> float:
+    """Shape deck time into a deterministic rise/dip journey, not one midpoint."""
+    preference = DURATION_JOURNEY[index % len(DURATION_JOURNEY)]
+    current_energy = float(current.get("energy", 0.5))
+    incoming_energy = float(upcoming.get("energy", 0.5))
+    if current_energy >= 0.78:
+        preference -= 0.10
+    if incoming_energy >= current_energy + 0.16:
+        preference -= 0.07
+    elif current_energy <= 0.42 and incoming_energy <= current_energy:
+        preference += 0.08
+    return float(np.clip(preference, 0.18, 0.88))
 
 
 def clip_for(track: dict[str, Any], source_start: float, source_end: float) -> AudioSegment:
@@ -1749,6 +2131,122 @@ def monitor_transition(outgoing: AudioSegment, incoming: AudioSegment, blended: 
     return round(0.78 * planned_score + 0.22 * acoustic_score, 1)
 
 
+def overlay_with_headroom(
+    outgoing: AudioSegment, incoming: AudioSegment, ceiling_dbfs: float = TRANSITION_OVERLAY_CEILING_DBFS,
+) -> tuple[AudioSegment, dict[str, float]]:
+    """Sum two decks in float and apply gain before integer PCM can clip.
+
+    ``AudioSegment.overlay`` mixes in the segment's integer sample format. If
+    two aligned kicks momentarily sum above full scale, clipping occurs there
+    and a later master limiter can only limit the already-distorted result.
+    This function observes the actual sample sum first, applies only the gain
+    necessary to keep a conservative transition ceiling, then converts once.
+    """
+    if not outgoing or not incoming:
+        bridge = outgoing.overlay(incoming)
+        return bridge, {"preOverlayPeakDbfs": float(bridge.max_dBFS), "overlayGainDb": 0.0}
+    incoming = incoming.set_frame_rate(outgoing.frame_rate).set_channels(outgoing.channels).set_sample_width(outgoing.sample_width)
+    channels = max(1, outgoing.channels)
+    raw_outgoing = np.asarray(outgoing.get_array_of_samples())
+    raw_incoming = np.asarray(incoming.get_array_of_samples())
+    frames = min(raw_outgoing.size // channels, raw_incoming.size // channels)
+    if frames <= 0:
+        bridge = outgoing.overlay(incoming)
+        return bridge, {"preOverlayPeakDbfs": float(bridge.max_dBFS), "overlayGainDb": 0.0}
+    sample_count = frames * channels
+    # max_possible_amplitude matches pydub's actual integer container width,
+    # including its 24-bit-to-32-bit conversion behaviour.
+    scale = max(float(outgoing.max_possible_amplitude), 1.0)
+    mixed = raw_outgoing[:sample_count].astype(np.float64) / scale
+    mixed += raw_incoming[:sample_count].astype(np.float64) / scale
+    pre_overlay_peak = float(np.max(np.abs(mixed)))
+    ceiling = 10 ** (min(-0.05, float(ceiling_dbfs)) / 20)
+    linear_gain = min(1.0, ceiling / max(pre_overlay_peak, 1e-12))
+    guarded = mixed * linear_gain
+    dtype = raw_outgoing.dtype
+    limits = np.iinfo(dtype)
+    container = np.clip(np.rint(guarded * scale), limits.min, limits.max).astype(dtype)
+    bridge = outgoing._spawn(container.tobytes())
+    return bridge, {
+        "preOverlayPeakDbfs": round(20 * math.log10(max(pre_overlay_peak, 1e-12)), 3),
+        "overlayGainDb": round(20 * math.log10(max(linear_gain, 1e-12)), 3),
+    }
+
+
+def low_frequency_phase_offset_ms(
+    outgoing: AudioSegment, incoming: AudioSegment, maximum_offset_ms: int = 24,
+) -> int:
+    """Find a small, confidence-gated kick-phase correction on rendered audio.
+
+    Beat grids constrain the planned timing, while this final pass observes the
+    actual low-frequency transients after FFmpeg's pitch-preserving stretch.
+    It searches only a tiny neighbourhood and retains zero offset unless the
+    low-band onset correlation has a clear improvement, so unrelated basslines
+    cannot pull an otherwise valid transition off-grid.
+    """
+    if not outgoing or not incoming or outgoing.frame_rate <= 0:
+        return 0
+
+    def onset_envelope(segment: AudioSegment) -> np.ndarray:
+        filtered = low_pass_filter(segment, 240)
+        raw = np.asarray(filtered.get_array_of_samples(), dtype=np.float32)
+        if filtered.channels > 1:
+            raw = raw.reshape((-1, filtered.channels)).mean(axis=1)
+        if raw.size < filtered.frame_rate // 2:
+            return np.empty(0, dtype=np.float32)
+        frame = max(1, round(filtered.frame_rate * 0.005))
+        usable = raw.size // frame * frame
+        rms = np.sqrt(np.mean(np.square(raw[:usable].reshape((-1, frame))), axis=1) + 1e-9)
+        # Kicks have a short positive envelope edge.  Retain a small RMS term
+        # for rounder four-on-the-floor kicks whose attack was compressed.
+        changes = np.maximum(0.0, np.diff(np.log(rms + 1e-6), prepend=np.log(rms[0] + 1e-6)))
+        envelope = changes + 0.12 * rms / max(float(np.percentile(rms, 90)), 1e-6)
+        return (envelope - np.mean(envelope)) / max(float(np.std(envelope)), 1e-6)
+
+    out = onset_envelope(outgoing)
+    inc = onset_envelope(incoming)
+    size = min(out.size, inc.size)
+    if size < 48:
+        return 0
+    out, inc = out[:size], inc[:size]
+    frames = max(1, round(maximum_offset_ms / 5))
+
+    def score(offset: int) -> float:
+        if offset > 0:
+            left, right = out[offset:], inc[:-offset]
+        elif offset < 0:
+            left, right = out[:offset], inc[-offset:]
+        else:
+            left, right = out, inc
+        if left.size < 32:
+            return -1.0
+        return float(np.dot(left, right) / max(left.size, 1))
+
+    baseline = score(0)
+    best_offset = max(range(-frames, frames + 1), key=score)
+    best_score = score(best_offset)
+    # A phase correction must be both meaningful and supported by an audible
+    # rhythmic correlation. Otherwise keeping the grid-derived zero offset is
+    # safer for breaks, vocal intros, and syncopated basslines.
+    if best_offset == 0 or best_score < 0.18 or best_score - baseline < 0.045:
+        return 0
+    return int(best_offset * 5)
+
+
+def apply_phase_offset(segment: AudioSegment, offset_ms: int) -> AudioSegment:
+    """Delay (positive) or advance (negative) a deck without changing length."""
+    if offset_ms == 0:
+        return segment
+    amount = min(abs(int(offset_ms)), max(0, len(segment) // 8))
+    if amount == 0:
+        return segment
+    silence = AudioSegment.silent(duration=amount, frame_rate=segment.frame_rate)
+    silence = silence.set_channels(segment.channels).set_sample_width(segment.sample_width)
+    if offset_ms > 0:
+        return (silence + segment)[:len(segment)]
+    return (segment[amount:] + silence)[:len(segment)]
+
+
 def fade_gains(
     progress: float,
     fade_shape: str,
@@ -1756,7 +2254,13 @@ def fade_gains(
     fade_in_curve: float | None = None,
 ) -> tuple[float, float]:
     """Return non-linear equal-power gains for a phrase-aware crossfade."""
-    if fade_out_curve is not None and fade_in_curve is not None:
+    if fade_shape == "vocal-carry":
+        # Keep the outgoing sentence intelligible through most of the phrase,
+        # then release it quickly at the musical boundary. The incoming deck
+        # can establish rhythm underneath without masking the words.
+        outgoing_progress = float(np.clip((progress - 0.62) / 0.38, 0, 1)) ** 0.78
+        incoming_progress = progress ** 1.28
+    elif fade_out_curve is not None and fade_in_curve is not None:
         outgoing_progress = progress ** float(np.clip(fade_out_curve, 0.35, 2.5))
         incoming_progress = progress ** float(np.clip(fade_in_curve, 0.35, 2.5))
     elif fade_shape == "fast-outgoing":
@@ -1802,7 +2306,10 @@ def progressive_spectrum_blend(
         progress = (index + 1) / chunks
         swap_phase = float(np.clip((progress - (swap_at - 0.10)) / 0.20, 0, 1))
         swap_curve = swap_phase * swap_phase * (3 - 2 * swap_phase)
-        outgoing_low_pass_hz = int(18_500 - 13_500 * progress)
+        if technique == "vocal-carry-bed":
+            outgoing_low_pass_hz = int(18_500 - 5_000 * progress)
+        else:
+            outgoing_low_pass_hz = int(18_500 - 13_500 * progress)
         outgoing_high_pass_hz = int(45 + max(120, abs(outgoing_low_db) * 16) * swap_curve)
         incoming_high_pass_hz = int(45 + max(120, abs(incoming_low_db) * 16) * (1 - swap_curve))
         outgoing_gain, incoming_gain = fade_gains(
@@ -1818,6 +2325,10 @@ def progressive_spectrum_blend(
             # Hold the incoming record deeper until the outgoing vocal has
             # cleared, then complete the same phrase-boundary bass exchange.
             incoming_gain -= (1 - swap_curve) * 4.5
+        elif technique == "vocal-carry-bed":
+            carry_release = float(np.clip((progress - 0.58) / 0.30, 0, 1))
+            carry_release = carry_release * carry_release * (3 - 2 * carry_release)
+            incoming_gain -= (1 - carry_release) * 6.0
         outgoing_chunk = low_pass_filter(outgoing[start:end], max(4_000, outgoing_low_pass_hz))
         outgoing_chunk = high_pass_filter(outgoing_chunk, max(45, outgoing_high_pass_hz)).apply_gain(outgoing_gain)
         incoming_chunk = high_pass_filter(incoming[start:end], max(45, incoming_high_pass_hz)).apply_gain(incoming_gain)
@@ -1847,10 +2358,15 @@ def blend(master: AudioSegment, incoming: AudioSegment, transition: dict[str, An
     loop_ms = min(overlap_ms, int(float(transition.get("loopSeconds", 0)) * 1000))
     if transition.get("beatMatched", False):
         outgoing = loop_phrase(outgoing, loop_ms, overlap_ms)
+        phase_offset_ms = low_frequency_phase_offset_ms(outgoing, incoming[:overlap_ms])
+        if phase_offset_ms:
+            incoming = apply_phase_offset(incoming, phase_offset_ms)
+        transition["lowFrequencyPhaseOffsetMs"] = phase_offset_ms
     filtered_outgoing, filtered_incoming = progressive_spectrum_blend(
         outgoing, incoming[:overlap_ms], overlap_ms, transition,
     )
-    bridge = filtered_outgoing.overlay(filtered_incoming)
+    bridge, overlay_metrics = overlay_with_headroom(filtered_outgoing, filtered_incoming)
+    transition.update(overlay_metrics)
     transition["renderQualityScore"] = monitor_transition(
         filtered_outgoing, filtered_incoming, bridge, float(transition["qualityScore"])
     )
@@ -1897,7 +2413,7 @@ def prepare_mix(request: dict[str, Any]) -> dict[str, Any]:
     mix_id = str(mix["id"])
     ensure_job_active("mix", mix_id)
     options = mix["options"]
-    candidates = ordered_tracks(tracks, options["genreOrder"])
+    candidates = ordered_tracks(tracks)
     if not candidates:
         raise HTTPException(422, "The preparation does not contain any tracks")
     for candidate in candidates:
@@ -1915,7 +2431,10 @@ def prepare_mix(request: dict[str, Any]) -> dict[str, Any]:
         if not kept:
             kept.append(candidate)
             continue
-        screening = transition_between(kept[-1], candidate, 0.0, options["minTrackSeconds"], options["maxTrackSeconds"])
+        screening = transition_between(
+            kept[-1], candidate, 0.0, options["minTrackSeconds"], options["maxTrackSeconds"],
+            duration_preference=duration_preference_for(len(kept) - 1, kept[-1], candidate),
+        )
         if screening is None:
             if len(rejected) < max_rejected:
                 rejected.append(candidate["id"])
@@ -1939,6 +2458,7 @@ def prepare_mix(request: dict[str, Any]) -> dict[str, Any]:
         transition = transition_between(
             current["track"], upcoming["track"], current["sourceStartSeconds"],
             options["minTrackSeconds"], options["maxTrackSeconds"], current["deckBpm"],
+            duration_preference_for(index, current["track"], upcoming["track"]),
         )
         if transition is None:
             raise HTTPException(422, "A selected track has no phrase-safe exit within the requested duration range")
@@ -1973,6 +2493,7 @@ def next_transition(request: dict[str, Any]) -> dict[str, Any]:
     transition = transition_between(
         current["track"], upcoming["track"], source_position, 4.0, 14.0,
         float(current.get("deckBpm") or current["track"]["bpm"]),
+        0.22,
     )
     if transition is None:
         raise HTTPException(422, "There is no natural skip point left in this track")

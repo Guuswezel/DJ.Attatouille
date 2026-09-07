@@ -280,7 +280,12 @@ class DifferentiableFeatureProjector(nn.Module):
         return mel, mir
 
 
-def export_policy(policy: TransitionPolicy, destination: Path, metadata: dict[str, Any] | None = None) -> Path:
+def export_policy(
+    policy: TransitionPolicy,
+    destination: Path,
+    metadata: dict[str, Any] | None = None,
+    compatibility_profile: dict[str, Any] | None = None,
+) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     state = policy.state_dict()
     if any(not torch.isfinite(value).all() for value in state.values()):
@@ -303,6 +308,8 @@ def export_policy(policy: TransitionPolicy, destination: Path, metadata: dict[st
         ],
         "training": metadata or {},
     }
+    if compatibility_profile is not None:
+        payload["compatibilityProfile"] = compatibility_profile
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
     temporary.replace(destination)

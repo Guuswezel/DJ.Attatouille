@@ -181,7 +181,13 @@ def features_from_bars(bars: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         rolloff = float(np.mean(librosa.feature.spectral_rolloff(S=spectrum, sr=FEATURE_SAMPLE_RATE))) / nyquist
         zcr = float(np.mean(librosa.feature.zero_crossing_rate(bar, frame_length=1024, hop_length=hop_length)))
         onset = float(np.mean(librosa.onset.onset_strength(y=bar, sr=FEATURE_SAMPLE_RATE, hop_length=hop_length))) / 10.0
-        chroma = np.mean(librosa.feature.chroma_stft(S=power, sr=FEATURE_SAMPLE_RATE), axis=1)
+        # Canonical bars can legitimately be empty at a context edge. The
+        # model needs a deterministic chroma vector, not a tuning estimate, so
+        # avoid librosa's empty-frequency tuning warning explicitly.
+        chroma = np.mean(
+            librosa.feature.chroma_stft(S=power, sr=FEATURE_SAMPLE_RATE, tuning=0.0),
+            axis=1,
+        )
         # A deliberately cheap voice-presence proxy.  Harmonix embeddings can
         # be added as a separate version without silently changing this schema.
         vocal_proxy = float(np.clip(mid * (1.0 - low) * 1.7, 0.0, 1.0))
