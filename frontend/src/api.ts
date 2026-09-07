@@ -21,6 +21,7 @@ export const api = {
     method: 'POST', body: JSON.stringify(payload),
   }),
   deletePreparation: (preparationId: string) => request<{ deletedPreparationId: string; deletedMixIds: string[] }>(`/api/preparations/${preparationId}`, { method: 'DELETE' }),
+  retryPreparation: (preparationId: string) => request<Preparation>(`/api/preparations/${preparationId}/retry`, { method: 'POST' }),
   deleteMix: (mixId: string) => request<{ deletedMixId: string }>(`/api/mixes/${mixId}`, { method: 'DELETE' }),
   nextTransition: (mixId: string, currentTrackIndex: number, playbackSeconds: number) => request<SkipPlan>(
     `/api/mixes/${mixId}/next-transition`,

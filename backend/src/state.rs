@@ -44,7 +44,11 @@ impl AppState {
             preparations: database.collection("preparations"),
             mixes: database.collection("mixes"),
             http: HttpClient::builder()
-                .timeout(Duration::from_secs(60 * 60))
+                // A large Harmonix library can legitimately take several
+                // hours on an M-series laptop. Per-track cache makes retries
+                // cheap; this timeout must not manufacture a failure while
+                // the worker is still publishing healthy progress updates.
+                .timeout(Duration::from_secs(24 * 60 * 60))
                 .build()
                 .context("building worker client")?,
             worker_url: env::var("WORKER_URL").unwrap_or_else(|_| "http://localhost:8090".into()),

@@ -20,6 +20,13 @@ services:
   worker:
     profiles: [container-worker]
 
+  trainer:
+    volumes: !override
+      - ${TRANSITION_TRAINING_PATH:-./.dj-attatouille-training}:/training
+      - ${DJ_DATA_PATH:-./.dj-attatouille-data}:/data
+      - ${TRAINING_INPUT_PATH:-./training-input}:/input:ro
+      - ${MUSIC_LIBRARY_PATH:-./music}:/music:ro
+
   # The native worker uses this local endpoint for its Qdrant vector calls.
   qdrant:
     ports:

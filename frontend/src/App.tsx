@@ -81,7 +81,7 @@ function decodedWaveform(buffer: AudioBuffer, count = 2048) {
 }
 
 function waveformDetailPointCount(track: Track) {
-  return Math.max(512, Math.ceil(track.durationSeconds * Math.max(track.bpm, 60) / 60 * 16))
+  return Math.max(1024, Math.ceil(track.durationSeconds * Math.max(track.bpm, 60) / 60 * 64))
 }
 
 function decodeWaveformDetail(encoded?: string | null) {
@@ -96,7 +96,13 @@ function decodeWaveformDetail(encoded?: string | null) {
 
 function Waveform({ active = true, track, item, elapsed }: { active?: boolean; track: Track; item: PlaylistItem; elapsed: number }) {
   const [decoded, setDecoded] = useState<{ trackId: string; points: number[] } | null>(null)
-  const storedDetail = useMemo(() => decodeWaveformDetail(track.waveformDetail), [track.waveformDetail])
+  // v1 detail payloads were generated from a feature stream that could not
+  // supply 64 points per beat, so their x-axis is not safe to compare with the
+  // beat grid. Decode the local source once until preparation refreshes it.
+  const storedDetail = useMemo(
+    () => track.waveformDetailVersion === 2 ? decodeWaveformDetail(track.waveformDetail) : null,
+    [track.waveformDetail, track.waveformDetailVersion],
+  )
   useEffect(() => {
     if (storedDetail) return
     let disposed = false
@@ -118,7 +124,10 @@ function Waveform({ active = true, track, item, elapsed }: { active?: boolean; t
   const sourceStart = clamp(item.sourceStartSeconds ?? 0, 0, duration)
   const sourceEnd = clamp(item.sourceEndSeconds ?? duration, sourceStart, duration) || duration
   const tempoRatio = item.deckBpm && track.bpm ? item.deckBpm / track.bpm : 1
-  const trackElapsed = active ? Math.max(0, elapsed - item.startSeconds) : 0
+  // `elapsed` is the rendered-mix clock. Keep mapping it into the source
+  // track while paused as well as playing; tying it to the visual animation
+  // state made the waveform jump back to the cue whenever playback paused.
+  const trackElapsed = Math.max(0, elapsed - item.startSeconds)
   const sourcePosition = clamp(sourceStart + trackElapsed * tempoRatio, sourceStart, sourceEnd)
   const windowSeconds = Math.min(10, duration)
   // Put the playhead one eighth from the left: the deck is forward-looking,
@@ -127,7 +136,7 @@ function Waveform({ active = true, track, item, elapsed }: { active?: boolean; t
   const beats = track.beatGrid.length ? track.beatGrid : fallbackBeats(track)
   const downbeats = new Set((track.downbeats.length ? track.downbeats : beats.filter((_, index) => index % 4 === 0)).map(beat => beat.toFixed(3)))
   const visibleBeats = beats.filter(beat => beat >= windowStart && beat <= windowStart + windowSeconds)
-  const topPointCount = Math.max(256, visibleBeats.length * 16)
+  const topPointCount = Math.max(512, visibleBeats.length * 64)
   const zoomedPoints = Array.from({ length: topPointCount }, (_, index) => sampleWaveform(points, (windowStart + index / Math.max(1, topPointCount - 1) * windowSeconds) / duration))
   const viewportX = windowStart / duration * 1000
   const viewportWidth = Math.max(5, windowSeconds / duration * 1000)
@@ -135,12 +144,12 @@ function Waveform({ active = true, track, item, elapsed }: { active?: boolean; t
   return <div className={`track-waveform ${active ? 'active' : ''}`} aria-label="Live beat waveform and full-track energy overview">
     <svg viewBox="0 0 1000 234" preserveAspectRatio="none" role="img">
       <rect className="wave-bg" x="0" y="0" width="1000" height="108" rx="8" />
+      <path className="zoom-wave-fill" d={waveformPath(zoomedPoints, 54, 38)} />
       {visibleBeats.map(beat => {
         const x = (beat - windowStart) / windowSeconds * 1000
         const downbeat = downbeats.has(beat.toFixed(3))
-        return <line key={`live-${beat}`} className={downbeat ? 'downbeat-line' : 'beat-line'} x1={x} x2={x} y1={downbeat ? 8 : 80} y2="100" />
+        return <line key={`live-${beat}`} className={downbeat ? 'downbeat-line' : 'beat-line'} x1={x} x2={x} y1={downbeat ? 8 : 12} y2="100" />
       })}
-      <path className="zoom-wave-fill" d={waveformPath(zoomedPoints, 54, 38)} />
       <line className="playhead-line" x1={playheadX} x2={playheadX} y1="4" y2="104" />
       <text className="wave-label" x="12" y="20">LIVE · BEAT GRID</text>
       <rect className="overview-bg" x="0" y="126" width="1000" height="100" rx="8" />
@@ -155,7 +164,7 @@ function Waveform({ active = true, track, item, elapsed }: { active?: boolean; t
   </div>
 }
 
-function Icon({ name, size = 18 }: { name: 'play' | 'pause' | 'skip' | 'volume' | 'plus' | 'library' | 'spark' | 'queue' | 'grip' | 'trash'; size?: number }) {
+function Icon({ name, size = 18 }: { name: 'play' | 'pause' | 'skip' | 'volume' | 'plus' | 'library' | 'spark' | 'queue' | 'grip' | 'trash' | 'fullscreen' | 'fullscreenExit'; size?: number }) {
   const paths = {
     play: <path d="M6 4.5v15l12-7.5-12-7.5Z" fill="currentColor" />,
     pause: <><path d="M6 4h4v16H6z" fill="currentColor" /><path d="M14 4h4v16h-4z" fill="currentColor" /></>,
@@ -167,6 +176,8 @@ function Icon({ name, size = 18 }: { name: 'play' | 'pause' | 'skip' | 'volume' 
     queue: <><path d="M5 6h14M5 12h14M5 18h9" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /><path d="m17 16 3 2-3 2" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></>,
     grip: <path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />,
     trash: <><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></>,
+    fullscreen: <path d="M8 4H4v4M16 4h4v4M20 16v4h-4M4 16v4h4" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />,
+    fullscreenExit: <path d="M9 4v5H4M15 4v5h5M20 15h-5v5M4 15h5v5" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />,
   }
   return <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden="true">{paths[name]}</svg>
 }
@@ -252,13 +263,15 @@ function AnalysisWaveLoader() {
   </div>
 }
 
-function PreparationProgressCard({ preparation }: { preparation: Preparation }) {
+function PreparationProgressCard({ preparation, onRetry }: { preparation: Preparation; onRetry: (preparation: Preparation) => Promise<void> }) {
   const total = preparation.discoveredTrackCount
   const analysed = preparation.analysedTrackCount
   const failed = preparation.failedTrackCount
+  const reused = preparation.cachedTrackCount ?? 0
   const processed = analysed + failed
   const currentPosition = preparation.currentTrack ? Math.min(total, processed + 1) : processed
   const active = ['queued', 'running'].includes(preparation.status)
+  const canRetry = preparation.status === 'failed'
   return <section className="progress-card preparation-progress" aria-live="polite">
     <div className="progress-top"><div><div className="eyebrow">Library preparation</div><h2>{preparation.label}</h2></div><JobPill status={preparation.status} /></div>
     {active && <AnalysisWaveLoader />}
@@ -266,63 +279,26 @@ function PreparationProgressCard({ preparation }: { preparation: Preparation }) 
     {total > 0 && <div className="analysis-details">
       <div><span>Tracks found</span><b>{total}</b></div>
       <div><span>Progress</span><b>{currentPosition} / {total}</b></div>
+      {reused > 0 && <div><span>Reused</span><b>{reused}</b></div>}
       {failed > 0 && <div><span>Skipped</span><b>{failed}</b></div>}
     </div>}
     {preparation.currentTrack && <div className="current-analysis"><span>Analysing now</span><b title={preparation.currentTrack}>{preparation.currentTrack}</b></div>}
     <div className="progress-line"><i style={{ width: `${preparation.progress}%` }} /></div>
-    <small>{preparation.progress}% complete{total > 0 ? ` · ${analysed} successfully analysed` : ' · scanning your music folder'}</small>
+    <small>{preparation.progress}% complete{total > 0 ? ` · ${analysed} prepared${reused ? `, ${reused} reused` : ''}` : ' · scanning your music folder'}</small>
+    {canRetry && <button className="primary-button" onClick={() => void onRetry(preparation)}><Icon name="spark" />Resume preparation</button>}
   </section>
 }
 
-function GenreOrder({ genres, onChange }: { genres: string[]; onChange: (genres: string[]) => void }) {
-  const [draggedGenre, setDraggedGenre] = useState<string | null>(null)
-  const [dropTarget, setDropTarget] = useState<string | null>(null)
-  const commitMove = (targetGenre: string) => {
-    if (!draggedGenre || draggedGenre === targetGenre) return
-    const source = genres.indexOf(draggedGenre)
-    const target = genres.indexOf(targetGenre)
-    if (source < 0 || target < 0) return
-    const reordered = [...genres]
-    reordered.splice(source, 1)
-    reordered.splice(target, 0, draggedGenre)
-    onChange(reordered)
-  }
-  return <div className="genre-order">
-    <div className="field-heading"><span>Genre journey</span><small>Drag to set the flow</small></div>
-    <div className="genre-list">
-      {genres.map((genre, index) => <div className={`genre-chip ${draggedGenre === genre ? 'dragging' : ''} ${dropTarget === genre ? 'drop-target' : ''}`} key={genre} draggable
-        onDragStart={event => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', genre); setDraggedGenre(genre) }}
-        onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropTarget(genre) }}
-        onDrop={event => { event.preventDefault(); commitMove(genre); setDraggedGenre(null); setDropTarget(null) }}
-        onDragLeave={() => setDropTarget(current => current === genre ? null : current)}
-        onDragEnd={() => { setDraggedGenre(null); setDropTarget(null) }}>
-        <Icon name="grip" size={15} /><span>{index + 1}</span>{genre}
-      </div>)}
-    </div>
-  </div>
-}
-
 function MixSetup({ preparation, onCreated }: { preparation: Preparation; onCreated: (mix: Mix) => void }) {
-  const [genres, setGenres] = useState(preparation.genres)
-  const preparationId = useRef(preparation.id)
   const [minSeconds, setMinSeconds] = useState(90)
   const [maxSeconds, setMaxSeconds] = useState(180)
   const [acceptance, setAcceptance] = useState(85)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  // The overview is polled every few seconds, creating a new `genres` array
-  // each time. Reset only when the user actually selects another preparation;
-  // otherwise a server refresh would erase a drag-and-drop reorder.
-  useEffect(() => {
-    if (preparationId.current !== preparation.id) {
-      preparationId.current = preparation.id
-      setGenres(preparation.genres)
-    }
-  }, [preparation.id, preparation.genres])
   const createMix = async () => {
     setLoading(true); setError('')
     try {
-      const options: MixOptions = { preparationId: preparation.id, genreOrder: genres, minTrackSeconds: minSeconds, maxTrackSeconds: maxSeconds, acceptancePercentage: acceptance }
+      const options: MixOptions = { preparationId: preparation.id, minTrackSeconds: minSeconds, maxTrackSeconds: maxSeconds, acceptancePercentage: acceptance }
       onCreated(await api.createMix(options))
     } catch (problem) { setError(problem instanceof Error ? problem.message : 'Could not create the mix') }
     finally { setLoading(false) }
@@ -330,14 +306,16 @@ function MixSetup({ preparation, onCreated }: { preparation: Preparation; onCrea
   return <section className="mix-setup">
     <div className="eyebrow"><Icon name="spark" size={15} /> Step 2 · Mix design</div>
     <div className="setup-title"><div><h1>Build a mix from <em>{preparation.label}.</em></h1><p>{preparation.trackCount} analysed tracks · all transition points are phrase-safe and quality scored.</p></div><span className="ready-stamp">Data preparation done</span></div>
-    <GenreOrder genres={genres} onChange={setGenres} />
+    <div className="genre-order energy-journey">
+      <div className="field-heading"><span>Energy-led sequence</span><small>Tracks progress from warm-up to peak energy. Genre never controls the order.</small></div>
+    </div>
     <div className="controls-grid">
       <label className="range-field"><span>Minimum per track <b>{Math.floor(minSeconds / 60)}m {minSeconds % 60}s</b></span><input type="range" min="30" max="300" step="15" value={minSeconds} onChange={event => setMinSeconds(Math.min(Number(event.target.value), maxSeconds - 15))} /></label>
       <label className="range-field"><span>Maximum per track <b>{Math.floor(maxSeconds / 60)}m {maxSeconds % 60}s</b></span><input type="range" min="45" max="360" step="15" value={maxSeconds} onChange={event => setMaxSeconds(Math.max(Number(event.target.value), minSeconds + 15))} /></label>
       <label className="range-field acceptance"><span>Track acceptance <b>{acceptance}%</b></span><input type="range" min="50" max="100" step="5" value={acceptance} onChange={event => setAcceptance(Number(event.target.value))} /><small>At most {Math.floor(preparation.trackCount * (100 - acceptance) / 100)} poor-fit tracks can be left out.</small></label>
     </div>
     {error && <p className="form-error">{error}</p>}
-    <button className="primary-button create-mix" onClick={createMix} disabled={loading || !genres.length}><Icon name="spark" />{loading ? 'Queueing mix…' : 'Create mix from preparation'}</button>
+    <button className="primary-button create-mix" onClick={createMix} disabled={loading}><Icon name="spark" />{loading ? 'Queueing mix…' : 'Create mix from preparation'}</button>
     {preparation.modelReport && <p className="model-note">{preparation.modelReport.structureModel} · {preparation.modelReport.embeddingModel}</p>}
   </section>
 }
@@ -439,18 +417,34 @@ function Player({ mix }: { mix: Mix }) {
     if (audio.current) audio.current.volume = nextVolume
     if (bridgeAudio.current) bridgeAudio.current.volume = nextVolume
   }
+  const seekTo = async (requestedSeconds: number) => {
+    const player = audio.current
+    if (!player || !mix.audioUrl) return
+    const target = clamp(requestedSeconds, 0, Math.max(0, mix.durationSeconds))
+    const shouldKeepPlaying = playing
+    if (bridgeAudio.current) bridgeAudio.current.pause()
+    if (bridging) setBridging(false)
+    player.currentTime = target
+    setElapsed(target)
+    setNotice('')
+    if (shouldKeepPlaying && player.paused) {
+      try { await player.play() } catch { setPlaying(false) }
+    }
+  }
+  const progressPercent = mix.durationSeconds ? clamp(elapsed / mix.durationSeconds * 100, 0, 100) : 0
+  const timebarStyle = { '--time-progress': `${progressPercent}%` } as React.CSSProperties
   return <section className="player">
     <audio ref={audio} src={mix.audioUrl ?? undefined} onTimeUpdate={event => setElapsed(event.currentTarget.currentTime)} onEnded={() => setPlaying(false)} />
     <audio ref={bridgeAudio} onEnded={() => setBridging(false)} />
     <div className="player-top"><div><div className="eyebrow"><Icon name="queue" size={15} /> Prepared mix</div><h1>{mix.name}</h1></div><div className="mix-meta"><span>{mix.playlist.length} tracks</span><span>{minutes(mix.durationSeconds)}</span>{!mix.audioUrl && <b>Audio render unavailable</b>}</div></div>
     <div className="decks"><Deck item={current} role="now" playing={playing} elapsed={elapsed} /><Deck item={next} role="next" playing={playing} elapsed={elapsed} /></div>
-    <div className="transport"><div className="time"><span>{minutes(elapsed)}</span><div><i style={{ width: `${mix.durationSeconds ? Math.min(100, elapsed / mix.durationSeconds * 100) : 0}%` }} /></div><span>{minutes(mix.durationSeconds)}</span></div><div className="player-actions"><button className="volume-button" aria-label="Volume"><Icon name="volume" /><input aria-label="Volume level" type="range" min="0" max="1" step="0.01" value={volume} onChange={event => setPlayerVolume(Number(event.target.value))} /></button><button className="play-button" onClick={toggle} disabled={!mix.audioUrl} aria-label={playing ? 'Pause mix' : 'Play mix'}><Icon name={playing ? 'pause' : 'play'} size={24} /></button><button className="skip-button" onClick={skip} disabled={!next || !mix.audioUrl || skipping} aria-label="Find a natural next transition"><Icon name="skip" />{skipping ? 'Finding…' : 'Next'}</button></div>{notice && <p className="player-notice">{notice}</p>}</div>
-    <div className="mobile-transport"><button className="play-button" onClick={toggle} disabled={!mix.audioUrl}><Icon name={playing ? 'pause' : 'play'} size={24} /></button><button className="skip-button" onClick={skip} disabled={!next || !mix.audioUrl || skipping}><Icon name="skip" />{skipping ? 'Finding…' : 'Next'}</button><label><Icon name="volume" /><input aria-label="Volume level" type="range" min="0" max="1" step="0.01" value={volume} onChange={event => setPlayerVolume(Number(event.target.value))} /></label></div>
+    <div className="transport"><div className="time"><span>{minutes(elapsed)}</span><label className="timebar" style={timebarStyle}><input aria-label="Seek within mix" type="range" min="0" max={Math.max(0, mix.durationSeconds)} step="0.01" value={clamp(elapsed, 0, Math.max(0, mix.durationSeconds))} disabled={!mix.audioUrl} onChange={event => void seekTo(Number(event.target.value))} /></label><span>{minutes(mix.durationSeconds)}</span></div><div className="player-actions"><button className="volume-button" aria-label="Volume"><Icon name="volume" /><input aria-label="Volume level" type="range" min="0" max="1" step="0.01" value={volume} onChange={event => setPlayerVolume(Number(event.target.value))} /></button><button className="play-button" onClick={toggle} disabled={!mix.audioUrl} aria-label={playing ? 'Pause mix' : 'Play mix'}><Icon name={playing ? 'pause' : 'play'} size={24} /></button><button className="skip-button" onClick={skip} disabled={!next || !mix.audioUrl || skipping} aria-label="Find a natural next transition"><Icon name="skip" />{skipping ? 'Finding…' : 'Next'}</button></div>{notice && <p className="player-notice">{notice}</p>}</div>
+    <div className="mobile-transport"><div className="time mobile-time"><span>{minutes(elapsed)}</span><label className="timebar" style={timebarStyle}><input aria-label="Seek within mix" type="range" min="0" max={Math.max(0, mix.durationSeconds)} step="0.01" value={clamp(elapsed, 0, Math.max(0, mix.durationSeconds))} disabled={!mix.audioUrl} onChange={event => void seekTo(Number(event.target.value))} /></label><span>{minutes(mix.durationSeconds)}</span></div><div className="mobile-actions"><button className="play-button" onClick={toggle} disabled={!mix.audioUrl}><Icon name={playing ? 'pause' : 'play'} size={24} /></button><button className="skip-button" onClick={skip} disabled={!next || !mix.audioUrl || skipping}><Icon name="skip" />{skipping ? 'Finding…' : 'Next'}</button><label><Icon name="volume" /><input aria-label="Volume level" type="range" min="0" max="1" step="0.01" value={volume} onChange={event => setPlayerVolume(Number(event.target.value))} /></label></div></div>
   </section>
 }
 
 function LibraryReady({ preparation }: { preparation: Preparation }) {
-  return <section className="library-ready"><div className="eyebrow"><Icon name="library" size={15} /> Analysed crate</div><h1>{preparation.label}</h1><p>{preparation.trackCount} tracks are ready. Choose a genre order to turn it into a continuous mix.</p><div className="track-table"><div className="track-row header"><span>Track</span><span>Genre</span><span>BPM</span><span>Key</span><span>Energy</span></div>{preparation.tracks.slice(0, 7).map(track => <div className="track-row" key={track.id}><span><Artwork track={track} size="small" /><b>{track.title}<small>{track.artist}</small></b></span><span>{track.genres.join(', ')}</span><span>{track.bpm.toFixed(0)}</span><span>{track.key}</span><span><i className="energy-bar"><b style={{ width: `${track.energy * 100}%` }} /></i></span></div>)}</div></section>
+  return <section className="library-ready"><div className="eyebrow"><Icon name="library" size={15} /> Analysed crate</div><h1>{preparation.label}</h1><p>{preparation.trackCount} tracks are ready. Mixes rise from warm-up to peak energy; genre remains descriptive only.</p><div className="track-table"><div className="track-row header"><span>Track</span><span>Genre</span><span>BPM</span><span>Key</span><span>Energy</span></div>{[...preparation.tracks].sort((left, right) => left.energy - right.energy || left.bpm - right.bpm || left.title.localeCompare(right.title)).slice(0, 7).map(track => <div className="track-row" key={track.id}><span><Artwork track={track} size="small" /><b>{track.title}<small>{track.artist}</small></b></span><span>{track.genres.join(', ')}</span><span>{track.bpm.toFixed(0)}</span><span>{track.key}</span><span><i className="energy-bar"><b style={{ width: `${track.energy * 100}%` }} /></i></span></div>)}</div></section>
 }
 
 export default function App() {
@@ -460,6 +454,7 @@ export default function App() {
   const [showCreate, setShowCreate] = useState(true)
   const [error, setError] = useState('')
   const [deletingId, setDeletingId] = useState<string>()
+  const [focusMode, setFocusMode] = useState(false)
   const load = useCallback(async () => {
     try { setOverview(await api.overview()); setError('') } catch (problem) { setError(problem instanceof Error ? problem.message : 'The local API is unavailable') }
   }, [])
@@ -468,12 +463,28 @@ export default function App() {
     const interval = window.setInterval(load, overview.activeJobs > 0 ? 1000 : 5000)
     return () => window.clearInterval(interval)
   }, [load, overview.activeJobs])
+  useEffect(() => {
+    const syncFocusMode = () => setFocusMode(Boolean(document.fullscreenElement))
+    document.addEventListener('fullscreenchange', syncFocusMode)
+    return () => document.removeEventListener('fullscreenchange', syncFocusMode)
+  }, [])
   const selectedPreparation = useMemo(() => overview.preparations.find(item => item.id === selectedPreparationId), [overview.preparations, selectedPreparationId])
   const selectedMix = useMemo(() => overview.mixes.find(item => item.id === selectedMixId), [overview.mixes, selectedMixId])
   const choosePreparation = (id: string) => { setSelectedPreparationId(id); setSelectedMixId(undefined); setShowCreate(false) }
   const chooseMix = (id: string) => { setSelectedMixId(id); setShowCreate(false) }
   const createdPreparation = (item: Preparation) => { setOverview(current => ({ ...current, preparations: [item, ...current.preparations] })); choosePreparation(item.id) }
   const createdMix = (item: Mix) => { setOverview(current => ({ ...current, mixes: [item, ...current.mixes] })); chooseMix(item.id) }
+  const retryPreparation = async (preparation: Preparation) => {
+    setError('')
+    try {
+      const retried = await api.retryPreparation(preparation.id)
+      setOverview(current => ({
+        ...current,
+        activeJobs: current.activeJobs + (['queued', 'running'].includes(preparation.status) ? 0 : 1),
+        preparations: current.preparations.map(item => item.id === retried.id ? retried : item),
+      }))
+    } catch (problem) { setError(problem instanceof Error ? problem.message : 'Could not resume the preparation') }
+  }
   const deletePreparation = async (preparation: Preparation) => {
     const mixCount = overview.mixes.filter(mix => mix.options.preparationId === preparation.id).length
     const related = mixCount ? ` and its ${mixCount} prepared mix${mixCount === 1 ? '' : 'es'}` : ''
@@ -504,10 +515,22 @@ export default function App() {
     } catch (problem) { setError(problem instanceof Error ? problem.message : 'Could not delete the mix') }
     finally { setDeletingId(undefined) }
   }
+  const toggleFullscreen = async () => {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen()
+      return
+    }
+    if (focusMode) {
+      setFocusMode(false)
+      return
+    }
+    setFocusMode(true)
+    try { await document.documentElement.requestFullscreen() } catch { /* Focus mode remains available when the browser blocks fullscreen. */ }
+  }
   const working = Boolean(selectedPreparation && ['queued', 'running'].includes(selectedPreparation.status)) || Boolean(selectedMix && ['queued', 'running'].includes(selectedMix.status))
-  return <div className="app-shell"><Sidebar overview={overview} selectedPrep={selectedPreparationId} selectedMix={selectedMixId} deletingId={deletingId} onSelectPrep={choosePreparation} onSelectMix={chooseMix} onDeletePreparation={deletePreparation} onDeleteMix={deleteMix} onNew={() => { setShowCreate(true); setSelectedPreparationId(undefined); setSelectedMixId(undefined) }} />
-    <main><header><div className="live-dot"><i />Local session</div><div className="header-right">{overview.activeJobs > 0 && <span className="job-count">{overview.activeJobs} task{overview.activeJobs > 1 ? 's' : ''} running</span>}<span>DJ.Attatouille v0.1</span></div></header>
+  return <div className={`app-shell ${focusMode ? 'focus-mode' : ''}`}><Sidebar overview={overview} selectedPrep={selectedPreparationId} selectedMix={selectedMixId} deletingId={deletingId} onSelectPrep={choosePreparation} onSelectMix={chooseMix} onDeletePreparation={deletePreparation} onDeleteMix={deleteMix} onNew={() => { setShowCreate(true); setSelectedPreparationId(undefined); setSelectedMixId(undefined) }} />
+    <main><header><div className="live-dot"><i />Local session</div><div className="header-right">{overview.activeJobs > 0 && <span className="job-count">{overview.activeJobs} task{overview.activeJobs > 1 ? 's' : ''} running</span>}<span>DJ.Attatouille v0.1</span><button className="fullscreen-button" onClick={() => void toggleFullscreen()} aria-label={focusMode ? 'Exit fullscreen focus mode' : 'Enter fullscreen focus mode'} aria-pressed={focusMode}><Icon name={focusMode ? 'fullscreenExit' : 'fullscreen'} size={16} /><span>{focusMode ? 'Exit focus' : 'Fullscreen'}</span></button></div></header>
       {error && <div className="api-error">{error}. Start the stack with <code>docker compose up --build</code>.</div>}
-      <div className="content">{showCreate ? <FolderPreparation busy={overview.activeJobs > 0} onCreated={createdPreparation} /> : selectedMix ? selectedMix.status === 'ready' ? <Player mix={selectedMix} /> : <ProgressCard item={selectedMix} /> : selectedPreparation ? selectedPreparation.status === 'ready' ? <><MixSetup preparation={selectedPreparation} onCreated={createdMix} /><LibraryReady preparation={selectedPreparation} /></> : <PreparationProgressCard preparation={selectedPreparation} /> : <FolderPreparation busy={working} onCreated={createdPreparation} />}</div>
+      <div className="content">{showCreate ? <FolderPreparation busy={overview.activeJobs > 0} onCreated={createdPreparation} /> : selectedMix ? selectedMix.status === 'ready' ? <Player mix={selectedMix} /> : <ProgressCard item={selectedMix} /> : selectedPreparation ? selectedPreparation.status === 'ready' ? <><MixSetup preparation={selectedPreparation} onCreated={createdMix} /><LibraryReady preparation={selectedPreparation} /></> : <PreparationProgressCard preparation={selectedPreparation} onRetry={retryPreparation} /> : <FolderPreparation busy={working} onCreated={createdPreparation} />}</div>
     </main></div>
 }

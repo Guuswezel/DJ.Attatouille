@@ -117,6 +117,7 @@ pub async fn create_preparation(
         discovered_track_count: 0,
         analysed_track_count: 0,
         failed_track_count: 0,
+        cached_track_count: 0,
         current_track: None,
         genres: vec![],
         tracks: vec![],
@@ -154,6 +155,7 @@ pub async fn update_preparation_progress(
         "discoveredTrackCount": update.discovered_track_count as i64,
         "analysedTrackCount": update.analysed_track_count as i64,
         "failedTrackCount": update.failed_track_count as i64,
+        "cachedTrackCount": update.cached_track_count as i64,
         "message": update.message,
         "updatedAt": Utc::now().to_rfc3339(),
     };
@@ -163,6 +165,33 @@ pub async fn update_preparation_progress(
     );
     repository::update_preparation(&state, &id, doc! { "$set": changes }).await?;
     Ok(Json(json!({ "status": "updated" })))
+}
+
+pub async fn retry_preparation(
+    Path(id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Preparation> {
+    let preparation = repository::find_preparation(&state, &id).await?;
+    if preparation.status != "failed" {
+        return Err(ApiError::bad_request(
+            "Only a failed preparation can be resumed.",
+        ));
+    }
+    repository::update_preparation(
+        &state,
+        &id,
+        doc! { "$set": doc! {
+            "status": "queued", "progress": 0i32,
+            "message": "Waiting to resume from cached track analysis",
+            "currentTrack": Bson::Null,
+            "updatedAt": Utc::now().to_rfc3339(),
+        } },
+    )
+    .await?;
+    let job_state = state.clone();
+    let job_id = id.clone();
+    tokio::spawn(async move { run_analysis(job_state, job_id).await });
+    repository::find_preparation(&state, &id).await.map(Json)
 }
 
 pub async fn list_mixes(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Mix>> {
@@ -205,12 +234,6 @@ pub async fn create_mix(
             "This library is still being prepared.",
         ));
     }
-    if options.genre_order.is_empty() {
-        return Err(ApiError::bad_request(
-            "Choose at least one genre for the mix journey.",
-        ));
-    }
-
     let now = Utc::now().to_rfc3339();
     let mix = Mix {
         id: Uuid::new_v4().to_string(),
@@ -273,6 +296,7 @@ async fn run_analysis(state: Arc<AppState>, preparation_id: String) {
             "discoveredTrackCount": (result.tracks.len() + result.failures.len()) as i64,
             "analysedTrackCount": result.tracks.len() as i64,
             "failedTrackCount": result.failures.len() as i64,
+            "cachedTrackCount": result.cached_track_count as i64,
             "currentTrack": Bson::Null,
             "genres": mongodb::bson::to_bson(&result.genres)?, "modelReport": mongodb::bson::to_bson(&result.model_report)?,
             "updatedAt": Utc::now().to_rfc3339()

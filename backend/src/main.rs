@@ -42,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
             post(routes::update_preparation_progress),
         )
         .route(
+            "/api/preparations/:id/retry",
+            post(routes::retry_preparation),
+        )
+        .route(
             "/api/mixes",
             get(routes::list_mixes).post(routes::create_mix),
         )
